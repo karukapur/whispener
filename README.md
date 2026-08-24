@@ -1,54 +1,58 @@
 # Listener
 
-Listener is a privacy-forward Android prototype for live **Traditional Chinese** transcription and optional, ChatGPT-style context updates. It targets API 35, supports API 26+, and is designed around the Samsung Galaxy Z Flip6's portrait, split-screen, folded cover, and unfolded/landscape window sizes.
+Listener is a privacy-forward Android beta for understanding Chinese speech. Whisper runs on the phone with overlapping live transcription and preserves the Chinese transcript; an optional user-selected free OpenRouter model maintains a concise English context summary. The first hardware target is the Samsung Galaxy Z Flip6. The app targets API 35 and supports API 26+.
 
-## Setup
+## Build and install
 
-1. Install Android Studio with Android SDK 35 and JDK 17.
-2. Run `./gradlew :app:assembleDebug` and install `app/build/outputs/apk/debug/app-debug.apk`.
-3. On first use, review privacy onboarding and grant microphone (and Android 13+ notification) permission. Recording **never starts with permission grant**: press **開始** explicitly. The persistent notification provides an immediate Stop action.
-4. In Settings → Remote context, enter an OpenRouter API key. It is encrypted using an Android Keystore-backed master key and is never logged. Remote summaries may be disabled while local transcription continues.
+Prerequisites are Android Studio/JDK 17, Android SDK 35, NDK `28.0.13004108`, and CMake `3.22.1`. Gradle is configured to download missing SDK components when Android licenses have been accepted. The native build fetches whisper.cpp tag `v1.9.2` and pinned Khronos Vulkan/SPIR-V headers into the build directory; it never loads an unpinned branch.
 
-No Whisper API key or cloud speech service is required. For production, build the maintained `whisper.cpp` Android example/JNI library as an AAR and implement the small `WhisperEngine` boundary. This repository deliberately does not link the desktop Open Super Whisper application. Its separation of model discovery, manifests, downloads, and inference sessions is useful architectural inspiration; its desktop runtime is not Android-compatible.
+```sh
+./gradlew test lintDebug assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+```
 
-## Architecture and privacy boundary
+For local debug builds that should start with an OpenRouter key already available, copy the placeholder from `local.properties.example` into your git-ignored `local.properties` file:
 
-* `audio/` owns the explicitly initiated foreground microphone service and lifecycle state machine. PCM is 16 kHz mono. The service is `START_NOT_STICKY`, stops synchronously on request, and will not silently resume after process death.
-* `speech/` is the Android inference boundary for whisper.cpp, fixed to language `zh`, streaming PCM chunks through VAD and emitting partial/final timestamped results. Implementations should attempt NNAPI/GPU acceleration and fall back to CPU after a device capability check.
-* `data/session/` stores sessions, immutable original timestamped segments, separately edited display text, summaries, cadence, and installed model metadata in Room. Cascade deletion occurs only after UI confirmation. Export uses edited display text without destroying original segments.
-* `models/` keeps JSON manifests separate from binaries. WorkManager downloads are resumable via HTTP Range, cancellable, checksum-gated, and report progress. An actively loaded model cannot be deleted. Version selection must expose upgrades and explicit downgrades.
-* `context/` fetches OpenRouter's live `/api/v1/models` catalog rather than hard-coding “DeepSeek V4.” It submits **only** prior global context, a bounded recent transcript window, and newly finalized transcript text at the selected 5/10-second cadence. It requires `globalContext` plus exactly 2–3 `details`, retains the last valid result, and treats offline, HTTP 401, 429, timeouts, and malformed output as non-fatal UI states.
+```properties
+OPENROUTER_API_KEY=sk-or-v1-your-key
+```
 
-### Exactly what leaves the phone
+The Settings key stored in encrypted preferences still takes priority. The local build key is only a convenience fallback and is embedded in the debug APK, so use a development key you are comfortable rotating.
 
-When (and only when) the user enables remote summarization, finalized **text excerpts**, the previous global summary, and the recent bounded text window leave the phone for the selected OpenRouter model. Raw audio, partial hypotheses, model files, session titles, database contents, and the API key do not form prompt content. OpenRouter and the chosen provider have their own retention policies; review those before use. A retention slider governs local session deletion.
+On first launch:
 
-## Model choices and device benchmark
+1. Review privacy onboarding and continue. The app schedules the pinned 142 MB multilingual Base model download.
+2. Wait for Tiny to show as installed under Models.
+3. Tap Start and grant microphone permission. Permission approval never starts recording by itself; tap Start again if permission was previously denied.
+4. For English context, save an OpenRouter key under Settings, refresh the live catalog, select a currently free structured-output text model, and enable summaries.
 
-| Quantized multilingual model | Approx. download | Relative speed | Approx. working memory | Guidance |
-|---|---:|---|---:|---|
-| Tiny | 75 MB | Fastest | 250 MB | Lowest accuracy; conservative default |
-| Base | 142 MB | Balanced | 400 MB | Recommended candidate after measurement |
-| Small | 466 MB | Slower | 1 GB | Do not default before sustained tests |
+## Data and runtime flow
 
-Sizes and memory are planning estimates and vary by quantization/build. **No physical Flip6 measurements have been recorded in this repository yet**, so none is represented as proven real-time. Before shipping, run at least 30 minutes of representative zh-TW speech on a physical Flip6 for every variant and record: real-time factor and p50/p95 chunk latency, word/character error rate, peak RSS, dropped audio, battery delta, surface/battery temperature, and thermal-throttling status in the table below.
+- Audio is captured as 16 kHz mono PCM inside a microphone foreground service. It is buffered only in memory, never written to disk, and never uploaded.
+- Energy-based voice activity detection creates bounded utterances. A six-utterance inference queue stops with an explicit error instead of silently dropping audio if the device cannot keep up.
+- whisper.cpp transcribes locally with language `zh`, Traditional Chinese prompting, rolling overlap, and automatic Vulkan-to-CPU fallback. The app stores immutable finalized timestamped segments in Room; provisional text and audio remain memory-only.
+- When remote summaries are enabled, each selected 5/10-second interval containing new finalized text sends the prior English context, a bounded recent Chinese window, and the new Chinese text. The requested response is an English `globalContext` with exactly 2–3 English `details`.
+- Offline, timeout, invalid-key, rate-limit, and malformed-output failures keep the last valid English context. They never stop local transcription.
+- The OpenRouter key is stored with Android Keystore-backed encrypted preferences. Backups and cleartext network traffic are disabled.
+- A daily WorkManager task enforces the chosen local retention period. Session deletion remains explicitly confirmed in the UI.
 
-| Device/build/model | p50/p95 latency | Real-time factor | Peak RSS | Thermal/battery | Result |
-|---|---|---|---|---|---|
-| Galaxy Z Flip6 / pending | Not measured | Not measured | Not measured | Not measured | Pending physical hardware |
+## Design system
 
-Suggested device command: `./gradlew :app:connectedAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.listener.app.WhisperLatencyBenchmark`. Capture Perfetto and `adb shell dumpsys thermalservice` before and after each sustained run. Larger models must remain unavailable as defaults until latency, memory pressure, and thermal load pass agreed thresholds.
+Listener uses Material 3 with semantic primary, surface, outline, and error colors; Roboto platform typography; a 4/8/12/16/24/32/48 dp spacing scale; 48 dp minimum touch targets; bottom navigation for four primary destinations; scrollable content for font scaling; and TalkBack labels for navigation and recording state. Wide landscape windows use two content panes, while portrait, cover-size, and split-screen windows stack them.
 
-## OpenRouter model selection
+## Quality gates
 
-“Free” pricing and model identifiers change. The app should refresh the live catalog, present currently zero-priced candidates, and require user confirmation. A production release **must revalidate the OpenRouter free catalog, provider availability, context limits, privacy terms, and structured-output support**; there is intentionally no compiled-in free default.
+```sh
+./gradlew test
+./gradlew lintDebug assembleDebug
+./gradlew connectedAndroidTest
+```
 
-## Quality checks
+Flip6 acceptance covers portrait, landscape, narrow split-screen, cover-window behavior where Samsung permits it, large fonts, microphone denial/retry, background recording, notification Stop, audio-focus interruption, process recreation, offline transcription, OpenRouter HTTP 401/429 behavior, and a 30-minute Tiny-model soak. Device screenshots, UI dumps, logs, memory, battery, and thermal evidence belong in `artifacts/`.
 
-* `./gradlew test` — validators, compaction, redaction, checksums, cadence, and recording transitions.
-* `./gradlew connectedAndroidTest` — Room persistence/edit/delete and Compose adaptive UI on configured window-size emulators.
-* Foldable QA should cover 376×480 cover, narrow split-screen, portrait main display, landscape/two-pane, font scaling, interruption by calls/audio focus, backgrounding, Stop notification, and process recreation.
+## Beta limitations
 
-## Known integration work
-
-This scaffold contains the production boundaries and data/security rules, but the JNI whisper.cpp AAR, navigation/settings wiring, real HTTP summary request body, call/audio-focus callback, scheduled retention worker, and physical-device measurements remain integration tasks. They are intentionally not simulated or claimed complete.
+- This is a USB-installed debug beta, not a release-signed or Play Store build.
+- Native inference is initially CPU-only and packaged for `arm64-v8a`; Flip6 latency and thermals must be measured before expanding model defaults.
+- OpenRouter free-model availability and quotas can change. The app does not invent a remaining-quota value; it reports actual API failures and retains the last valid context.
+- No physical Flip6 measurements have been recorded in this repository yet.

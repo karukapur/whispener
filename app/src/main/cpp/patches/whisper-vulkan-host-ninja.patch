@@ -1,0 +1,58 @@
+diff --git a/ggml/src/ggml-vulkan/CMakeLists.txt b/ggml/src/ggml-vulkan/CMakeLists.txt
+index 1dc6a14..0629c39 100644
+--- a/ggml/src/ggml-vulkan/CMakeLists.txt
++++ b/ggml/src/ggml-vulkan/CMakeLists.txt
+@@ -36,6 +36,12 @@ endfunction()
+ #  TEST_SHADER_FILE - Path to the test shader file
+ #  RESULT_VARIABLE - Name of the variable to set (ON/OFF) based on test result
+ function(test_shader_extension_support EXTENSION_NAME TEST_SHADER_FILE RESULT_VARIABLE)
++    if(ANDROID)
++        set(${RESULT_VARIABLE} OFF PARENT_SCOPE)
++        list(APPEND VULKAN_SHADER_GEN_CMAKE_ARGS -D${RESULT_VARIABLE}=OFF)
++        set(VULKAN_SHADER_GEN_CMAKE_ARGS "${VULKAN_SHADER_GEN_CMAKE_ARGS}" PARENT_SCOPE)
++        return()
++    endif()
+     execute_process(
+         COMMAND ${Vulkan_GLSLC_EXECUTABLE} -o - -fshader-stage=compute --target-env=vulkan1.3 "${TEST_SHADER_FILE}"
+         OUTPUT_VARIABLE glslc_output
+@@ -177,7 +183,8 @@ if (Vulkan_FOUND)
+     ExternalProject_Add(
+         vulkan-shaders-gen
+         SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vulkan-shaders
+-        CMAKE_ARGS -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
++        CMAKE_ARGS -DCMAKE_MAKE_PROGRAM=${CMAKE_MAKE_PROGRAM}
++                   -DCMAKE_INSTALL_PREFIX=${CMAKE_BINARY_DIR}/$<CONFIG>
+                    -DCMAKE_INSTALL_BINDIR=.
+                    -DCMAKE_BUILD_TYPE=$<CONFIG>
+                    ${VULKAN_SHADER_GEN_CMAKE_ARGS}
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 510fb68..bf66adb 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -6461,7 +6461,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
+         }
+ #endif
+ 
+-        vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
++        ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(device->physical_device, &device_features2);
+ 
+         device->has_internally_synchronized_queues = internally_synchronized_queues_features.internallySynchronizedQueues;
+ 
+@@ -7082,7 +7082,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
+     }
+ #endif
+ 
+-    vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
++    ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(physical_device, &device_features2);
+ 
+     fp16 = fp16 && vk12_features.shaderFloat16;
+ 
+@@ -18523,7 +18523,7 @@ static bool ggml_vk_device_is_supported(const vk::PhysicalDevice & vkdev) {
+     vk11_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+     device_features2.pNext = &vk11_features;
+ 
+-    vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
++    ggml_vk_default_dispatcher().vkGetPhysicalDeviceFeatures2(vkdev, &device_features2);
+ 
+     return vk11_features.storageBuffer16BitAccess;
+ }

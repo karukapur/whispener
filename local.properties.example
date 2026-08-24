@@ -1,0 +1,3 @@
+# Copy this line into local.properties and put your real key there.
+# local.properties is git-ignored by this project.
+OPENROUTER_API_KEY=

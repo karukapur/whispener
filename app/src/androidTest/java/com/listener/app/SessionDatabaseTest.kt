@@ -16,8 +16,19 @@ import org.junit.runner.RunWith
     @Test fun editingPreservesOriginalSegmentsAndConfirmedDeleteCascades() = runBlocking {
         val dao = db.sessions(); val id = dao.insert(SessionEntity(title = "Original", startedAt = 1))
         dao.insertSegment(TranscriptSegmentEntity(sessionId = id, startMs = 0, endMs = 2, originalText = "原文", final = true))
+        dao.insertSummary(SummaryEntity(sessionId = id, createdAt = 2, globalContext = "Meeting", detailsJson = "[\"Detail one\",\"Detail two\"]"))
         dao.edit(id, "Edited", "編輯文字")
         Assert.assertEquals("原文", dao.segments(id).single().originalText)
-        SessionRepository(dao).deleteConfirmed(id, true); Assert.assertTrue(dao.segments(id).isEmpty())
+        Assert.assertEquals("編輯文字", SessionRepository(dao).export(id))
+        SessionRepository(dao).deleteConfirmed(id, true)
+        Assert.assertTrue(dao.segments(id).isEmpty()); Assert.assertTrue(dao.summaries(id).isEmpty())
+    }
+    @Test fun retentionDeletesOnlyCompletedOldSessions() = runBlocking {
+        val dao = db.sessions()
+        val old = dao.insert(SessionEntity(title = "Old", startedAt = 1, endedAt = 2))
+        val active = dao.insert(SessionEntity(title = "Active", startedAt = 1))
+        dao.deleteEndedBefore(3)
+        Assert.assertNull(dao.session(old))
+        Assert.assertNotNull(dao.session(active))
     }
 }

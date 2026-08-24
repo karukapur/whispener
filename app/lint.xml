@@ -2,5 +2,9 @@
 <lint>
     <issue id="NewApi" severity="error" />
     <issue id="MissingPermission" severity="error" />
-    <issue id="LogNotTimber" severity="ignore" />
+    <!-- Versions are intentionally pinned for the reproducible beta toolchain. -->
+    <issue id="AndroidGradlePluginVersion" severity="ignore" />
+    <issue id="GradleDependency" severity="ignore" />
+    <!-- The first phone handoff intentionally ships arm64-v8a only. -->
+    <issue id="ChromeOsAbiSupport" severity="ignore" />
 </lint>

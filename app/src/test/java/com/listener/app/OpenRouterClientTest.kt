@@ -1,0 +1,150 @@
+package com.listener.app
+
+import com.listener.app.context.*
+import kotlinx.coroutines.test.runTest
+import kotlinx.serialization.json.JsonPrimitive
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.OkHttpClient
+import okhttp3.mockwebserver.SocketPolicy
+import org.junit.After
+import org.junit.Assert.*
+import org.junit.Before
+import org.junit.Test
+import java.util.concurrent.TimeUnit
+
+class OpenRouterClientTest {
+    private lateinit var server: MockWebServer
+    private lateinit var client: OpenRouterClient
+
+    @Before fun setUp() {
+        server = MockWebServer().also { it.start() }
+        client = OpenRouterClient(baseUrl = server.url("api/v1/").toString())
+    }
+
+    @After fun tearDown() = server.shutdown()
+
+    @Test fun catalogKeepsOnlyFreeTextStructuredModels() = runTest {
+        server.enqueue(MockResponse().setBody("""{"data":[
+            {"id":"free/model","name":"Free","pricing":{"prompt":"0","completion":"0.000000"},"architecture":{"output_modalities":["text"]},"supported_parameters":["structured_outputs"]},
+            {"id":"paid/model","name":"Paid","pricing":{"prompt":"0.1","completion":"0"},"architecture":{"output_modalities":["text"]},"supported_parameters":["structured_outputs"]},
+            {"id":"free/image","name":"Image","pricing":{"prompt":"0","completion":"0"},"architecture":{"output_modalities":["image"]},"supported_parameters":["structured_outputs"]}
+        ]}"""))
+        val result = client.fetchFreeModels("secret") as RemoteResult.Success<List<OpenRouterModel>>
+        assertEquals(listOf("free/model"), result.value.map { it.id })
+        val request = server.takeRequest()
+        assertEquals("Bearer secret", request.getHeader("Authorization"))
+        assertTrue(request.path.orEmpty().contains("sort=latency-low-to-high"))
+        assertTrue(request.path.orEmpty().contains("supported_parameters=structured_outputs"))
+    }
+
+    @Test fun summaryParsesRequiredEnglishContextShape() = runTest {
+        val drafts = mutableListOf<ListeningContext>()
+        server.enqueue(sse(
+            "{\"globalContext\":\"A work meeting\"",
+            ",\"details\":[\"A deadline is discussed\"",
+            ",\"Someone asks a question\"]}",
+        ))
+        val result = client.summarize("secret", "free/model", "", "中文", "中文") { drafts += it } as RemoteResult.Success<ListeningContext>
+        assertEquals("A work meeting", result.value.globalContext)
+        assertTrue(drafts.isNotEmpty())
+        assertEquals("A work meeting", drafts.first().globalContext)
+        val requestBody = server.takeRequest().body.readUtf8()
+        assertTrue(requestBody.contains(""""stream":true"""))
+        assertTrue(requestBody.contains("json_schema"))
+        assertTrue(requestBody.contains("require_parameters"))
+        assertTrue(requestBody.contains("max_price"))
+    }
+
+    @Test fun summaryAcceptsLooseHeadingAndBulletsFromModel() = runTest {
+        server.enqueue(sse("Global context: Lunch planning\nDetails:\n- They are choosing food\n- Noodles are mentioned"))
+        val result = client.summarize("secret", "openrouter/free", "", "中文", "中文") as RemoteResult.Success<ListeningContext>
+        assertEquals("Lunch planning", result.value.globalContext)
+        assertEquals(listOf("They are choosing food", "Noodles are mentioned"), result.value.details)
+    }
+
+    @Test fun summaryPromptRequestsLiveHeadingDetailsAndTopicReset() = runTest {
+        server.enqueue(sse("""{"globalContext":"Planning lunch","details":["They are choosing a restaurant","One person prefers noodles"]}"""))
+        client.summarize(
+            apiKey = "secret",
+            model = "free/model",
+            priorEnglishContext = "Old project discussion",
+            recentChineseTranscript = "我們等一下要吃什麼？",
+            newChineseText = "我想吃麵。",
+        )
+
+        val requestBody = server.takeRequest().body.readUtf8()
+        assertTrue(requestBody.contains("one short English heading"))
+        assertTrue(requestBody.contains("4 to 6 concise English bullet-style details"))
+        assertTrue(requestBody.contains("keep the same globalContext"))
+        assertTrue(requestBody.contains("update details in place"))
+        assertTrue(requestBody.contains("reset both globalContext and details"))
+        assertTrue(requestBody.contains("Do not translate line by line"))
+        assertTrue(requestBody.contains("Do not invent names, facts, decisions, or action items"))
+        assertTrue(requestBody.contains("Old project discussion"))
+        assertTrue(requestBody.contains("我們等一下要吃什麼？"))
+        assertTrue(requestBody.contains("我想吃麵。"))
+    }
+
+    @Test fun rateLimitIsTypedAndNonThrowing() = runTest {
+        server.enqueue(MockResponse().setResponseCode(429))
+        val result = client.summarize("secret", "free/model", "old", "中文", "中文") as RemoteResult.Failure
+        assertEquals(RemoteStatus.RateLimited, result.status)
+    }
+
+    @Test fun malformedSummaryIsRejected() = runTest {
+        server.enqueue(sse("not-json"))
+        val result = client.summarize("secret", "free/model", "", "中文", "中文") as RemoteResult.Failure
+        assertEquals(RemoteStatus.InvalidResponse, result.status)
+    }
+
+    @Test fun streamedSummaryIgnoresDoneEmptyAndNonContentEvents() = runTest {
+        server.enqueue(sseRaw(
+            "data:\n\n",
+            """data: {"choices":[{"delta":{}}]}""" + "\n\n",
+            sseData("""{"globalContext":"Travel","details":["A station is mentioned"]}"""),
+            "data: [DONE]\n\n",
+        ))
+        val result = client.summarize("secret", "free/model", "", "中文", "中文") as RemoteResult.Success<ListeningContext>
+        assertEquals("Travel", result.value.globalContext)
+        assertEquals(listOf("A station is mentioned"), result.value.details)
+    }
+
+    @Test fun unavailableModelIsTypedAndKeepsOpenRouterMessage() = runTest {
+        server.enqueue(MockResponse().setResponseCode(404).setBody("""{"error":{"message":"No endpoints found that support structured outputs."}}"""))
+        val result = client.summarize("secret", "missing/model", "", "中文", "中文") as RemoteResult.Failure
+        assertEquals(RemoteStatus.ModelUnavailable, result.status)
+        assertEquals("No endpoints found that support structured outputs.", result.message)
+    }
+
+    @Test fun invalidKeyIsTyped() = runTest {
+        server.enqueue(MockResponse().setResponseCode(401))
+        val result = client.fetchFreeModels("bad") as RemoteResult.Failure
+        assertEquals(RemoteStatus.InvalidKey, result.status)
+    }
+
+    @Test fun timeoutIsTyped() = runTest {
+        val fastClient = OpenRouterClient(
+            OkHttpClient.Builder().callTimeout(100, TimeUnit.MILLISECONDS).build(),
+            server.url("api/v1/").toString(),
+        )
+        server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val result = fastClient.fetchFreeModels("secret") as RemoteResult.Failure
+        assertEquals(RemoteStatus.TimedOut, result.status)
+    }
+
+    @Test fun networkFailureIsTypedOffline() = runTest {
+        val unreachable = OpenRouterClient(baseUrl = "http://127.0.0.1:1/api/v1/")
+        val result = unreachable.fetchFreeModels("secret") as RemoteResult.Failure
+        assertEquals(RemoteStatus.Offline, result.status)
+    }
+
+    private fun sse(vararg chunks: String): MockResponse =
+        sseRaw(*(chunks.map(::sseData) + "data: [DONE]\n\n").toTypedArray())
+
+    private fun sseRaw(vararg events: String): MockResponse =
+        MockResponse().setHeader("Content-Type", "text/event-stream").setBody(events.joinToString(""))
+
+    private fun sseData(content: String): String =
+        """data: {"choices":[{"delta":{"content":${JsonPrimitive(content)}}}]}""" + "\n\n"
+}

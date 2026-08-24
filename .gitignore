@@ -1,7 +1,9 @@
 .gradle/
 local.properties
 **/build/
+**/.cxx/
 *.iml
 .idea/
+local.properties
 captures/
-gradle/wrapper/gradle-wrapper.jar
+.foglamp/
