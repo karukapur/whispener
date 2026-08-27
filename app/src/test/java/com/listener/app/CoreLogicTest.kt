@@ -3,8 +3,14 @@ package com.listener.app
 import com.listener.app.audio.*
 import com.listener.app.context.*
 import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
+import com.listener.app.data.DEFAULT_SUMMARY_CADENCE_MILLIS
+import com.listener.app.data.ListenerPreferences
+import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
+import com.listener.app.data.cadenceMillisPreference
+import com.listener.app.data.snapSummaryCadenceMillis
+import com.listener.app.data.toSummaryIntervalSeconds
 import com.listener.app.models.ModelManager
 import com.listener.app.models.resolveLocalModelSelection
 import com.listener.app.speech.OverlapTranscriptMerger
@@ -60,6 +66,14 @@ class CoreLogicTest {
         )
         assertEquals("", null.toPromptContext())
     }
+    @Test fun priorEnglishSummaryCanBeSentAsJson() {
+        val context = ListeningContext("Planning lunch", listOf("They are choosing a restaurant", "One person prefers noodles"))
+        assertEquals(
+            """{"globalContext":"Planning lunch","details":["They are choosing a restaurant","One person prefers noodles"]}""",
+            context.toPromptJson(),
+        )
+        assertEquals("", null.toPromptJson())
+    }
     @Test fun remoteSummariesUseFinalizedTranscriptOnly() {
         val state = ListenerRuntimeState(stableTranscript = "已完成", provisionalTranscript = "還在變")
         assertEquals("已完成", state.finalizedTranscriptForSummary())
@@ -87,11 +101,174 @@ class CoreLogicTest {
         assertFalse(vad.containsSpeech(shortArrayOf(0, 100, -449)))
         assertTrue(vad.containsSpeech(shortArrayOf(0, 450)))
     }
-    @Test fun intervalAcceptsUserSwitch() { var interval = 5; interval = 10; assertEquals(10, interval) }
+    @Test fun cadenceFallbackMapsLegacySecondsToMillis() {
+        assertEquals(5_000, cadenceMillisPreference(storedMillis = null, legacySeconds = 5))
+        assertEquals(10_000, cadenceMillisPreference(storedMillis = null, legacySeconds = 10))
+        assertEquals(DEFAULT_SUMMARY_CADENCE_MILLIS, cadenceMillisPreference(storedMillis = null, legacySeconds = null))
+        assertEquals(2_500, cadenceMillisPreference(storedMillis = 2_500, legacySeconds = 10))
+    }
 
-    @Test fun defaultOpenRouterModelUsesFastFreeStructuredModel() {
-        assertEquals("nvidia/nemotron-nano-9b-v2:free", DEFAULT_OPENROUTER_MODEL_ID)
+    @Test fun cadenceMillisClampsSnapsAndRoundsSessionSecondsUp() {
+        assertEquals(500, 100.snapSummaryCadenceMillis())
+        assertEquals(500, 749.snapSummaryCadenceMillis())
+        assertEquals(1_000, 750.snapSummaryCadenceMillis())
+        assertEquals(2_500, 2_510.snapSummaryCadenceMillis())
+        assertEquals(10_000, 12_000.snapSummaryCadenceMillis())
+        assertEquals(1, 500.toSummaryIntervalSeconds())
+        assertEquals(3, 2_500.toSummaryIntervalSeconds())
+        assertEquals(10, 10_000.toSummaryIntervalSeconds())
+    }
+
+    @Test fun unchangedSummaryCommitDoesNotAppendHistory() {
+        val previous = ListeningContext("Planning lunch", listOf("They prefer noodles"))
+        val state = StreamingContextState(
+            current = previous,
+            history = listOf(ContextHistoryEntry(previous, 1L)),
+            draft = ListeningContext("Draft", listOf("Noise")),
+            isStreaming = true,
+        )
+        val commit = commitSummaryResult(state, previous, 2L)
+        assertFalse(commit.changed)
+        assertEquals(listOf(ContextHistoryEntry(previous, 1L)), commit.state.history)
+        assertEquals(previous, commit.state.current)
+        assertNull(commit.state.draft)
+        assertFalse(commit.state.isStreaming)
+        assertEquals(2L, commit.state.lastUpdatedAtMillis)
+    }
+
+    @Test fun changedSummaryCommitAppendsHistory() {
+        val previous = ListeningContext("Planning lunch", listOf("They prefer noodles"))
+        val next = ListeningContext("Planning dinner", listOf("They mention a later meal"))
+        val commit = commitSummaryResult(
+            StreamingContextState(current = previous, history = listOf(ContextHistoryEntry(previous, 1L)), isStreaming = true),
+            next,
+            2L,
+        )
+        assertTrue(commit.changed)
+        assertEquals(next, commit.state.current)
+        assertEquals(2, commit.state.history.size)
+        assertEquals(next, commit.state.history.last().context)
+    }
+
+    @Test fun summaryPromptInputsUseCompactPreviousSummaryTailAndDelta() {
+        val stableBefore = "舊".repeat(6_000)
+        val fullDelta = "新".repeat(2_500)
+        val inputs = summaryPromptInputs(
+            transcript = stableBefore + fullDelta,
+            lastSentTranscript = stableBefore,
+            currentContext = ListeningContext("Previous heading", List(6) { "Previous detail $it with extra text" }),
+        )
+        assertTrue(inputs.previousEnglishSummary.contains("Previous heading"))
+        assertTrue(inputs.previousEnglishSummary.length <= 2_000)
+        assertEquals("舊".repeat(800), inputs.chineseContinuityTail)
+        assertEquals("新".repeat(2_000), inputs.newChineseDelta)
+        assertEquals(fullDelta, inputs.fullDelta)
+    }
+
+    @Test fun summaryGateCoalescesOverlappingRequests() {
+        val gate = SummaryRequestGate()
+        assertTrue(gate.tryStart())
+        assertFalse(gate.tryStart())
+        gate.finish()
+        assertTrue(gate.tryStart())
+    }
+
+    @Test fun summaryDebugTraceFlushesPendingLinesToSessionAndRedactsSecrets() {
+        val dir = createTempDirectory("listener-summary-trace").toFile()
+        val trace = SummaryDebugTrace(dir) { 1_000L }
+        trace.startNewRecording(
+            preferences = ListenerPreferences(remoteEnabled = true),
+            apiKeyPresent = true,
+            runtime = ListenerRuntimeState(recording = false),
+        )
+        trace.append(
+            sessionId = 42,
+            label = "summary_response_failed",
+            fields = mapOf("message" to "Bearer abc.def sk-or-v1-secret", "reason" to "InvalidKey"),
+        )
+
+        val text = trace.readForSession(42)
+
+        assertTrue(text.contains("trace_started_for_recording"))
+        assertTrue(text.contains("summary_response_failed"))
+        assertTrue(text.contains("[REDACTED]"))
+        assertFalse(text.contains("sk-or-v1-secret"))
+        dir.deleteRecursively()
+    }
+
+    @Test fun failedSummaryTraceIncludesSafeRemoteDiagnosticsAndNoTranscriptAdvance() {
+        val diagnostics = RemoteFailureDiagnostics(
+            responseChars = 48,
+            streamDeltaChars = 48,
+            doneSeen = true,
+            parseStage = "stream_final_model_output",
+            finishReason = "stop",
+            responseHash = "abc123",
+            safeResponseExcerpt = """{"globalContext":"Draft"}""",
+        )
+
+        val line = buildTraceLine(
+            timeMillis = 1_000L,
+            label = "summary_response_failed",
+            fields = mapOf(
+                "remoteStatus" to RemoteStatus.InvalidResponse.toString(),
+                "lastSentTranscriptAdvanced" to false.yesNoForTest(),
+            ) + diagnostics.toSummaryTraceFields(),
+        )
+
+        assertTrue(line.contains("summary_response_failed"))
+        assertTrue(line.contains("lastSentTranscriptAdvanced=no"))
+        assertTrue(line.contains("responseChars=48"))
+        assertTrue(line.contains("streamDeltaChars=48"))
+        assertTrue(line.contains("doneSeen=yes"))
+        assertTrue(line.contains("parseStage=stream_final_model_output"))
+        assertTrue(line.contains("finishReason=stop"))
+        assertTrue(line.contains("sseErrorSeen=no"))
+        assertTrue(line.contains("responseHash=abc123"))
+        assertTrue(line.contains("""safeResponseExcerpt={"globalContext":"Draft"}"""))
+    }
+
+    @Test fun detailedSummaryTraceIncludesDebugGuideSnapshotAndRuntimeLog() {
+        val text = buildDetailedSummaryTrace(
+            persistedSummaryTrace = "Persisted summary\n- Useful detail",
+            runtimeTrace = "summary_attempt_skipped reason=missing_openrouter_key",
+            diagnostics = SummaryDiagnostics(phase = "Waiting for OpenRouter key", transcriptChars = 500, deltaChars = 0),
+            sessionId = 7,
+        )
+
+        assertTrue(text.contains("Listener detailed summary trace"))
+        assertTrue(text.contains("Session ID: 7"))
+        assertTrue(text.contains("If the Chinese transcript is good but English is missing"))
+        assertTrue(text.contains("missing_openrouter_key"))
+        assertTrue(text.contains("phase=Waiting for OpenRouter key"))
+        assertTrue(text.contains("Persisted summary"))
+        assertTrue(text.contains("summary_attempt_skipped"))
+    }
+
+    @Test fun defaultOpenRouterModelUsesFreeRouter() {
+        assertEquals("openrouter/free", DEFAULT_OPENROUTER_MODEL_ID)
         assertEquals(DEFAULT_OPENROUTER_MODEL_ID, com.listener.app.data.ListenerPreferences().selectedModel)
+    }
+
+    @Test fun openRouterCatalogAlwaysIncludesFreeRouterFallback() {
+        assertEquals(listOf(OPENROUTER_FREE_ROUTER_MODEL_ID), emptyList<OpenRouterModel>().withOpenRouterFreeRouter().map { it.id })
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID, "free/model"),
+            listOf(OpenRouterModel("free/model", "Free model")).withOpenRouterFreeRouter().map { it.id },
+        )
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID),
+            listOf(OpenRouterModel(OPENROUTER_FREE_ROUTER_MODEL_ID, "Router")).withOpenRouterFreeRouter().map { it.id },
+        )
+    }
+
+    @Test fun modelUnavailableRetriesWithFreeRouterOnlyWhenUseful() {
+        val unavailable = RemoteResult.Failure(RemoteStatus.ModelUnavailable, "No endpoints found for nvidia/nemotron-nano-9b-v2:free.")
+        val invalid = RemoteResult.Failure(RemoteStatus.InvalidResponse, "Malformed JSON")
+
+        assertTrue(shouldRetrySummaryWithFreeRouter("nvidia/nemotron-nano-9b-v2:free", unavailable))
+        assertFalse(shouldRetrySummaryWithFreeRouter(OPENROUTER_FREE_ROUTER_MODEL_ID, unavailable))
+        assertFalse(shouldRetrySummaryWithFreeRouter("free/model", invalid))
     }
 
     @Test fun transcriptionEnginePreferenceFallsBackToWhisper() {
@@ -212,4 +389,6 @@ class CoreLogicTest {
     @Test fun normalizedChineseOverlapIgnoresPunctuationAndSpaces() {
         assertEquals("今天很好", OverlapTranscriptMerger.appendNovel("你好，世界", "你好世界 今天很好"))
     }
+
+    private fun Boolean.yesNoForTest(): String = if (this) "yes" else "no"
 }

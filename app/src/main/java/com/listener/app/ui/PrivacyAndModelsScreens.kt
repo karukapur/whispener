@@ -16,6 +16,9 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.listener.app.context.OpenRouterModel
+import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
+import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
 import com.listener.app.models.ConservativeModels
@@ -52,14 +55,27 @@ import com.listener.app.speech.InferenceBackend
     apiKeyPresent: Boolean,
     remoteEnabled: Boolean,
     retentionDays: Int,
+    selectedModel: String?,
+    catalog: List<OpenRouterModel>,
+    catalogLoading: Boolean,
     message: String?,
     onSaveKey: (String) -> Unit,
     onClearKey: () -> Unit,
     onRemoteEnabled: (Boolean) -> Unit,
     onRetentionDays: (Int) -> Unit,
+    onRefreshCatalog: () -> Unit,
+    onSelectRemoteModel: (String) -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
     var retentionSelection by remember(retentionDays) { mutableFloatStateOf(retentionDays.toFloat()) }
+    val modelOptions = remember(catalog) {
+        if (catalog.any { it.id == OPENROUTER_FREE_ROUTER_MODEL_ID }) {
+            catalog
+        } else {
+            listOf(OpenRouterModel(OPENROUTER_FREE_ROUTER_MODEL_ID, "OpenRouter free router")) + catalog
+        }
+    }
+    val currentModel = selectedModel ?: DEFAULT_OPENROUTER_MODEL_ID
     Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Remote English context", style = MaterialTheme.typography.headlineSmall)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -81,6 +97,34 @@ import com.listener.app.speech.InferenceBackend
         HorizontalDivider()
         Text("OpenRouter free routing is used for English context summaries.", style = MaterialTheme.typography.bodySmall)
         message?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
+        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("Summary model", style = MaterialTheme.typography.titleMedium)
+                Text(currentModel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            TextButton(enabled = apiKeyPresent && !catalogLoading, onClick = onRefreshCatalog) {
+                Text(if (catalogLoading) "Refreshing" else "Refresh")
+            }
+        }
+        modelOptions.forEach { model ->
+            Row(
+                Modifier
+                    .fillMaxWidth()
+                    .selectable(
+                        selected = currentModel == model.id,
+                        role = Role.RadioButton,
+                        onClick = { onSelectRemoteModel(model.id) },
+                    )
+                    .padding(vertical = 6.dp),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                RadioButton(selected = currentModel == model.id, onClick = null)
+                Column(Modifier.padding(start = 8.dp)) {
+                    Text(model.name, style = MaterialTheme.typography.bodyMedium)
+                    Text(model.id, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+        }
         Text("Every interval containing new finalized text creates one OpenRouter request. HTTP 429 keeps the last valid context and never stops local recording.", style = MaterialTheme.typography.bodySmall)
         HorizontalDivider()
         Text("Local privacy", style = MaterialTheme.typography.titleMedium)

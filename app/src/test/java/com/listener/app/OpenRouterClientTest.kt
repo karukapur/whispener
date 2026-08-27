@@ -1,6 +1,7 @@
 package com.listener.app
 
 import com.listener.app.context.*
+import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.mockwebserver.MockResponse
@@ -47,8 +48,10 @@ class OpenRouterClientTest {
         ))
         val result = client.summarize("secret", "free/model", "", "中文", "中文") { drafts += it } as RemoteResult.Success<ListeningContext>
         assertEquals("A work meeting", result.value.globalContext)
+        assertEquals(listOf("A deadline is discussed", "Someone asks a question"), result.value.details)
         assertTrue(drafts.isNotEmpty())
         assertEquals("A work meeting", drafts.first().globalContext)
+        assertTrue(drafts.any { it.details == listOf("A deadline is discussed") })
         val requestBody = server.takeRequest().body.readUtf8()
         assertTrue(requestBody.contains(""""stream":true"""))
         assertTrue(requestBody.contains("json_schema"))
@@ -63,27 +66,43 @@ class OpenRouterClientTest {
         assertEquals(listOf("They are choosing food", "Noodles are mentioned"), result.value.details)
     }
 
-    @Test fun summaryPromptRequestsLiveHeadingDetailsAndTopicReset() = runTest {
+    @Test fun summarySupportsOpenRouterFreeRouterModel() = runTest {
+        server.enqueue(sse("""{"globalContext":"Live context","details":["A useful detail"]}"""))
+        val result = client.summarize("secret", OPENROUTER_FREE_ROUTER_MODEL_ID, "", "中文", "中文") as RemoteResult.Success<ListeningContext>
+
+        assertEquals("Live context", result.value.globalContext)
+        assertTrue(server.takeRequest().body.readUtf8().contains(""""model":"openrouter/free""""))
+    }
+
+    @Test fun summaryPromptUsesDeltaTailAndPreviousJson() = runTest {
         server.enqueue(sse("""{"globalContext":"Planning lunch","details":["They are choosing a restaurant","One person prefers noodles"]}"""))
+        val continuityTail = "尾".repeat(800)
+        val delta = "新".repeat(2_000)
         client.summarize(
             apiKey = "secret",
             model = "free/model",
-            priorEnglishContext = "Old project discussion",
-            recentChineseTranscript = "我們等一下要吃什麼？",
-            newChineseText = "我想吃麵。",
+            priorEnglishContext = """{"globalContext":"Old project discussion","details":["A prior decision exists"]}""",
+            continuityChineseTail = continuityTail,
+            newChineseText = delta,
         )
 
         val requestBody = server.takeRequest().body.readUtf8()
         assertTrue(requestBody.contains("one short English heading"))
         assertTrue(requestBody.contains("4 to 6 concise English bullet-style details"))
+        assertTrue(requestBody.contains("new finalized Chinese delta as the main source of truth"))
+        assertTrue(requestBody.contains("Small Chinese continuity tail"))
+        assertTrue(requestBody.contains("New finalized Chinese delta"))
+        assertTrue(requestBody.contains("topic, preference, decision, constraint, disagreement, uncertainty, named entity, plan, or direction"))
+        assertTrue(requestBody.contains("return the previous JSON unchanged"))
         assertTrue(requestBody.contains("keep the same globalContext"))
         assertTrue(requestBody.contains("update details in place"))
         assertTrue(requestBody.contains("reset both globalContext and details"))
         assertTrue(requestBody.contains("Do not translate line by line"))
         assertTrue(requestBody.contains("Do not invent names, facts, decisions, or action items"))
         assertTrue(requestBody.contains("Old project discussion"))
-        assertTrue(requestBody.contains("我們等一下要吃什麼？"))
-        assertTrue(requestBody.contains("我想吃麵。"))
+        assertTrue(requestBody.contains(continuityTail))
+        assertTrue(requestBody.contains(delta))
+        assertFalse(requestBody.contains("Recent Chinese transcript"))
     }
 
     @Test fun rateLimitIsTypedAndNonThrowing() = runTest {
@@ -96,6 +115,21 @@ class OpenRouterClientTest {
         server.enqueue(sse("not-json"))
         val result = client.summarize("secret", "free/model", "", "中文", "中文") as RemoteResult.Failure
         assertEquals(RemoteStatus.InvalidResponse, result.status)
+        assertEquals("stream_final_model_output", result.diagnostics?.parseStage)
+        assertEquals(8, result.diagnostics?.streamDeltaChars)
+        assertTrue(result.diagnostics?.doneSeen == true)
+    }
+
+    @Test fun invalidFinalStreamCanEmitDraftButStillFails() = runTest {
+        val drafts = mutableListOf<ListeningContext>()
+        server.enqueue(sse("""{"globalContext":"Draft topic","details":["Draft detail""""))
+
+        val result = client.summarize("secret", "free/model", "", "中文", "中文") { drafts += it } as RemoteResult.Failure
+
+        assertEquals(listOf(ListeningContext("Draft topic", listOf("Draft detail"))), drafts)
+        assertEquals(RemoteStatus.InvalidResponse, result.status)
+        assertEquals("stream_final_model_output", result.diagnostics?.parseStage)
+        assertEquals(false, result.diagnostics?.safeResponseExcerpt?.contains("secret"))
     }
 
     @Test fun streamedSummaryIgnoresDoneEmptyAndNonContentEvents() = runTest {
@@ -103,11 +137,57 @@ class OpenRouterClientTest {
             "data:\n\n",
             """data: {"choices":[{"delta":{}}]}""" + "\n\n",
             sseData("""{"globalContext":"Travel","details":["A station is mentioned"]}"""),
+            """data: {"choices":[{"delta":{},"finish_reason":"stop"}]}""" + "\n\n",
             "data: [DONE]\n\n",
         ))
         val result = client.summarize("secret", "free/model", "", "中文", "中文") as RemoteResult.Success<ListeningContext>
         assertEquals("Travel", result.value.globalContext)
         assertEquals(listOf("A station is mentioned"), result.value.details)
+    }
+
+    @Test fun sseErrorEventIsTypedAndIncludesSafeDiagnostics() = runTest {
+        server.enqueue(sseRaw(
+            "event: error\n",
+            """data: {"error":{"type":"invalid_request_error","message":"No endpoints found that support structured outputs."}}""" + "\n\n",
+        ))
+
+        val result = client.summarize("secret", "free/model", "", "中文", "中文") as RemoteResult.Failure
+
+        assertEquals(RemoteStatus.ModelUnavailable, result.status)
+        assertEquals("No endpoints found that support structured outputs.", result.message)
+        assertEquals("stream_sse_error", result.diagnostics?.parseStage)
+        assertEquals("invalid_request_error", result.diagnostics?.sseErrorType)
+        assertEquals("No endpoints found that support structured outputs.", result.diagnostics?.sseErrorMessage)
+        assertNotNull(result.diagnostics?.responseHash)
+    }
+
+    @Test fun nonStreamingSummaryParsesMessageContentAndRejectsMalformedJson() = runTest {
+        server.enqueue(chatCompletion("""{"globalContext":"Workshop","details":["A setup issue is discussed"]}"""))
+        server.enqueue(chatCompletion("""{"globalContext":"Broken","details":["missing close""""))
+
+        val success = client.summarize(
+            apiKey = "secret",
+            model = "free/model",
+            priorEnglishContext = "",
+            continuityChineseTail = "中文",
+            newChineseText = "中文",
+            transportMode = SummaryTransportMode.NON_STREAMING,
+        ) as RemoteResult.Success<ListeningContext>
+        val failure = client.summarize(
+            apiKey = "secret",
+            model = "free/model",
+            priorEnglishContext = "",
+            continuityChineseTail = "中文",
+            newChineseText = "中文",
+            transportMode = SummaryTransportMode.NON_STREAMING,
+        ) as RemoteResult.Failure
+
+        assertEquals("Workshop", success.value.globalContext)
+        assertTrue(server.takeRequest().body.readUtf8().contains(""""stream":false"""))
+        assertEquals(RemoteStatus.InvalidResponse, failure.status)
+        assertEquals("non_streaming_final_model_output", failure.diagnostics?.parseStage)
+        assertEquals(0, failure.diagnostics?.streamDeltaChars)
+        assertTrue(server.takeRequest().body.readUtf8().contains(""""stream":false"""))
     }
 
     @Test fun unavailableModelIsTypedAndKeepsOpenRouterMessage() = runTest {
@@ -147,4 +227,9 @@ class OpenRouterClientTest {
 
     private fun sseData(content: String): String =
         """data: {"choices":[{"delta":{"content":${JsonPrimitive(content)}}}]}""" + "\n\n"
+
+    private fun chatCompletion(content: String): MockResponse =
+        MockResponse()
+            .setHeader("Content-Type", "application/json")
+            .setBody("""{"choices":[{"message":{"content":${JsonPrimitive(content)}},"finish_reason":"stop"}]}""")
 }

@@ -8,6 +8,8 @@ import com.listener.app.context.ListeningContext
 import com.listener.app.speech.InferenceBackend
 import com.listener.app.ui.ListeningScreen
 import com.listener.app.ui.ModelManagementScreen
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 
@@ -19,15 +21,18 @@ class AdaptiveLayoutTest {
     }
 
     @Test fun foldedLayoutKeepsTranscriptAndControlVisible() {
-        setTestContent { ListeningScreen(false, 0, 5, {}, {}) }
+        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
         compose.onNodeWithTag("transcript").assertExists(); compose.onNodeWithTag("record-toggle").assertIsDisplayed()
+        compose.onNodeWithText("English context").assertExists()
+        compose.onNodeWithText("English context will appear after remote summaries are enabled.").assertDoesNotExist()
+        compose.onNodeWithText("Summary trace").assertDoesNotExist()
     }
     @Test fun activeRecordingIsAnnounced() {
-        setTestContent { ListeningScreen(true, 65, 10, {}, {}) }
+        setTestContent { ListeningScreen(true, 65, 10_000, {}, {}) }
         compose.onNodeWithContentDescription("Recording active").assertExists()
     }
     @Test fun recordingRequiresInstalledModel() {
-        setTestContent { ListeningScreen(false, 0, 10, {}, {}, recordingAvailable = false) }
+        setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, recordingAvailable = false) }
         compose.onNodeWithTag("record-toggle").assertIsNotEnabled()
         compose.onNodeWithText("Model required").assertExists()
     }
@@ -37,7 +42,7 @@ class AdaptiveLayoutTest {
             ListeningScreen(
                 recording = true,
                 elapsedSeconds = 2,
-                intervalSeconds = 10,
+                intervalMillis = 10_000,
                 onIntervalChange = {},
                 onToggle = {},
                 stableTranscript = "穩定",
@@ -57,7 +62,7 @@ class AdaptiveLayoutTest {
             ListeningScreen(
                 recording = true,
                 elapsedSeconds = 2,
-                intervalSeconds = 10,
+                intervalMillis = 10_000,
                 onIntervalChange = {},
                 onToggle = {},
                 contextState = StreamingContextState(
@@ -76,7 +81,7 @@ class AdaptiveLayoutTest {
             ListeningScreen(
                 recording = true,
                 elapsedSeconds = 2,
-                intervalSeconds = 10,
+                intervalMillis = 10_000,
                 onIntervalChange = {},
                 onToggle = {},
                 contextState = StreamingContextState(
@@ -94,6 +99,44 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("Newest committed detail").assertExists()
         compose.onNodeWithContentDescription("Streaming English context update").assertExists()
         compose.onNodeWithText("Draft detail").assertExists()
+    }
+
+    @Test fun cadenceSliderShowsDecimalValuesAndReportsSnappedMillis() {
+        var selected = 0
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 2_500,
+                onIntervalChange = { millis: Int -> selected = millis },
+                onToggle = {},
+            )
+        }
+        compose.onNodeWithText("Summary every 2.5s").assertExists()
+        compose.onNodeWithContentDescription("Summary cadence 2.5s").assertExists()
+        compose.onNodeWithTag("cadence-slider").performTouchInput { swipeLeft() }
+        compose.runOnIdle {
+            assertTrue(selected in 500..10_000)
+            assertEquals(0, selected % 500)
+        }
+    }
+
+    @Test fun remoteErrorsStayInsideEnglishContextPanel() {
+        setTestContent {
+            ListeningScreen(
+                recording = true,
+                elapsedSeconds = 2,
+                intervalMillis = 500,
+                onIntervalChange = {},
+                onToggle = {},
+                stableTranscript = "你好",
+                remoteStatus = com.listener.app.context.RemoteStatus.ModelUnavailable,
+                remoteMessage = "No endpoints found for nvidia/nemotron-nano-9b-v2:free.",
+            )
+        }
+        compose.onNodeWithTag("english-context-status").assertExists()
+        compose.onNodeWithText("No endpoints found for nvidia/nemotron-nano-9b-v2:free.").assertExists()
+        compose.onNodeWithText("Recording  00:02").assertExists()
     }
 
     @Test fun modelCardsAreSingleChoiceAndLockedDuringRecording() {

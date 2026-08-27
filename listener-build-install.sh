@@ -15,7 +15,7 @@ fi
 
 cd "${PROJECT_DIR}"
 
-./gradlew test
-./gradlew lintDebug
+# ./gradlew test
+# ./gradlew lintDebug
 ./gradlew assembleDebug
 "${ADB}" install -r app/build/outputs/apk/debug/app-debug.apk

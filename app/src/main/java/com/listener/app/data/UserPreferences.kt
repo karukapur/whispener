@@ -8,7 +8,12 @@ import kotlinx.coroutines.flow.map
 
 private val Context.listenerDataStore by preferencesDataStore("listener_preferences")
 
-const val DEFAULT_OPENROUTER_MODEL_ID = "nvidia/nemotron-nano-9b-v2:free"
+const val OPENROUTER_FREE_ROUTER_MODEL_ID = "openrouter/free"
+const val DEFAULT_OPENROUTER_MODEL_ID = OPENROUTER_FREE_ROUTER_MODEL_ID
+const val MIN_SUMMARY_CADENCE_MILLIS = 500
+const val MAX_SUMMARY_CADENCE_MILLIS = 10_000
+const val SUMMARY_CADENCE_STEP_MILLIS = 500
+const val DEFAULT_SUMMARY_CADENCE_MILLIS = 5_000
 
 data class ListenerPreferences(
     val onboardingComplete: Boolean = false,
@@ -18,8 +23,11 @@ data class ListenerPreferences(
     val selectedLocalModelId: String? = null,
     val transcriptionEngine: TranscriptionEngine = TranscriptionEngine.WHISPER_CPP,
     val whisperWorkProfile: WhisperWorkProfile = WhisperWorkProfile.RESPONSIVE,
-    val summaryCadenceSeconds: Int = 10,
-)
+    val summaryCadenceMillis: Int = DEFAULT_SUMMARY_CADENCE_MILLIS,
+) {
+    val summaryCadenceSeconds: Int
+        get() = summaryCadenceMillis.toSummaryIntervalSeconds()
+}
 
 enum class TranscriptionEngine(val id: String) {
     WHISPER_CPP("whisper_cpp"),
@@ -49,7 +57,8 @@ class UserPreferences(private val context: Context) {
         val localModel = stringPreferencesKey("local_whisper_model")
         val transcriptionEngine = stringPreferencesKey("transcription_engine")
         val whisperWorkProfile = stringPreferencesKey("whisper_work_profile")
-        val cadence = intPreferencesKey("summary_cadence_seconds")
+        val cadenceSeconds = intPreferencesKey("summary_cadence_seconds")
+        val cadenceMillis = intPreferencesKey("summary_cadence_millis")
     }
 
     val values: Flow<ListenerPreferences> = context.listenerDataStore.data.map { prefs ->
@@ -61,7 +70,10 @@ class UserPreferences(private val context: Context) {
             selectedLocalModelId = prefs[Keys.localModel],
             transcriptionEngine = TranscriptionEngine.fromId(prefs[Keys.transcriptionEngine]),
             whisperWorkProfile = WhisperWorkProfile.fromId(prefs[Keys.whisperWorkProfile]),
-            summaryCadenceSeconds = prefs[Keys.cadence] ?: 10,
+            summaryCadenceMillis = cadenceMillisPreference(
+                storedMillis = prefs[Keys.cadenceMillis],
+                legacySeconds = prefs[Keys.cadenceSeconds],
+            ),
         )
     }
 
@@ -80,5 +92,19 @@ class UserPreferences(private val context: Context) {
     suspend fun clearSelectedLocalModel() = context.listenerDataStore.edit { it.remove(Keys.localModel) }
     suspend fun setTranscriptionEngine(engine: TranscriptionEngine) = context.listenerDataStore.edit { it[Keys.transcriptionEngine] = engine.id }
     suspend fun setWhisperWorkProfile(profile: WhisperWorkProfile) = context.listenerDataStore.edit { it[Keys.whisperWorkProfile] = profile.id }
-    suspend fun setCadence(seconds: Int) = context.listenerDataStore.edit { it[Keys.cadence] = if (seconds == 5) 5 else 10 }
+    suspend fun setCadence(seconds: Int) = setCadenceMillis(seconds * 1_000)
+    suspend fun setCadenceMillis(millis: Int) = context.listenerDataStore.edit { it[Keys.cadenceMillis] = millis.snapSummaryCadenceMillis() }
 }
+
+fun cadenceMillisPreference(storedMillis: Int?, legacySeconds: Int?): Int =
+    (storedMillis ?: legacySeconds?.times(1_000) ?: DEFAULT_SUMMARY_CADENCE_MILLIS).snapSummaryCadenceMillis()
+
+fun Int.snapSummaryCadenceMillis(): Int {
+    val clamped = coerceIn(MIN_SUMMARY_CADENCE_MILLIS, MAX_SUMMARY_CADENCE_MILLIS)
+    val offset = clamped - MIN_SUMMARY_CADENCE_MILLIS
+    val snappedOffset = ((offset + SUMMARY_CADENCE_STEP_MILLIS / 2) / SUMMARY_CADENCE_STEP_MILLIS) * SUMMARY_CADENCE_STEP_MILLIS
+    return (MIN_SUMMARY_CADENCE_MILLIS + snappedOffset).coerceIn(MIN_SUMMARY_CADENCE_MILLIS, MAX_SUMMARY_CADENCE_MILLIS)
+}
+
+fun Int.toSummaryIntervalSeconds(): Int =
+    (snapSummaryCadenceMillis() + 999) / 1_000

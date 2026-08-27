@@ -36,6 +36,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -51,8 +52,12 @@ import com.listener.app.SummaryDiagnostics
 import com.listener.app.StreamingContextState
 import com.listener.app.context.ListeningContext
 import com.listener.app.context.RemoteStatus
+import com.listener.app.data.MAX_SUMMARY_CADENCE_MILLIS
+import com.listener.app.data.MIN_SUMMARY_CADENCE_MILLIS
+import com.listener.app.data.SUMMARY_CADENCE_STEP_MILLIS
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
+import com.listener.app.data.snapSummaryCadenceMillis
 import com.listener.app.data.session.SessionEntity
 import com.listener.app.speech.InferenceBackend
 import kotlinx.coroutines.delay
@@ -135,23 +140,21 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
             composable(Destination.Listen.route) {
                 val setupMessage = when {
                     state.preferences.transcriptionEngine == TranscriptionEngine.WHISPER_CPP && state.installedModels.isEmpty() -> "A local Whisper model is required before recording. Open Models to view the Base download."
-                    state.preferences.remoteEnabled && !state.apiKeyPresent -> "Local transcription is ready. Add an OpenRouter key in Settings for English context."
-                    state.preferences.remoteEnabled && state.preferences.selectedModel == null -> "Local transcription is ready. Select a free OpenRouter model in Settings for English context."
                     else -> null
                 }
                 ListeningScreen(
                     recording = state.runtime.recording,
                     elapsedSeconds = state.runtime.elapsedSeconds,
-                    intervalSeconds = state.preferences.summaryCadenceSeconds,
-                    onIntervalChange = viewModel::setCadence,
+                    intervalMillis = state.preferences.summaryCadenceMillis,
+                    onIntervalChange = viewModel::setCadenceMillis,
                     onToggle = toggleRecording,
                     contextState = state.streamingContext,
                     summaryDiagnostics = state.summaryDiagnostics,
-                    emptyContextMessage = "English context will appear after remote summaries are enabled.",
+                    remoteMessage = state.remoteMessage,
                     stableTranscript = state.runtime.stableTranscript,
                     provisionalTranscript = state.runtime.provisionalTranscript,
-                    statusMessage = state.runtime.recoverableError ?: state.runtime.transcriptionStatus ?: state.remoteMessage ?: setupMessage,
-                    statusIsError = state.runtime.recoverableError != null || (state.remoteMessage != null && state.remoteStatus != RemoteStatus.Ready),
+                    statusMessage = state.runtime.recoverableError ?: state.runtime.transcriptionStatus ?: setupMessage,
+                    statusIsError = state.runtime.recoverableError != null,
                     remoteStatus = state.remoteStatus,
                     recordingAvailable = state.preferences.transcriptionEngine != TranscriptionEngine.WHISPER_CPP || state.installedModels.isNotEmpty(),
                     modelLoading = state.runtime.modelLoading,
@@ -161,7 +164,9 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     backend = state.runtime.backend,
                 )
             }
-            composable(Destination.Sessions.route) { SessionsScreen(state.sessions, viewModel) }
+            composable(Destination.Sessions.route) {
+                SessionsScreen(state.sessions, viewModel, state.summaryDiagnostics, state.streamingContext.isStreaming)
+            }
             composable(Destination.Models.route) {
                 ModelManagementScreen(
                     activeId = state.runtime.activeModelId,
@@ -187,11 +192,16 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     apiKeyPresent = state.apiKeyPresent,
                     remoteEnabled = state.preferences.remoteEnabled,
                     retentionDays = state.preferences.retentionDays,
+                    selectedModel = state.preferences.selectedModel,
+                    catalog = state.catalog,
+                    catalogLoading = state.catalogLoading,
                     message = state.remoteMessage,
                     onSaveKey = viewModel::saveApiKey,
                     onClearKey = viewModel::clearApiKey,
                     onRemoteEnabled = viewModel::setRemoteEnabled,
                     onRetentionDays = viewModel::setRetentionDays,
+                    onRefreshCatalog = viewModel::refreshCatalog,
+                    onSelectRemoteModel = viewModel::selectRemoteModel,
                 )
             }
         }
@@ -201,14 +211,15 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
 @Composable fun ListeningScreen(
     recording: Boolean,
     elapsedSeconds: Long,
-    intervalSeconds: Int,
+    intervalMillis: Int,
     onIntervalChange: (Int) -> Unit,
     onToggle: () -> Unit,
-    globalContext: String = "English context will appear here.",
-    details: List<String> = listOf("Audio remains on this device", "Remote summaries are optional"),
+    globalContext: String = "",
+    details: List<String> = emptyList(),
     contextState: StreamingContextState? = null,
     summaryDiagnostics: SummaryDiagnostics = SummaryDiagnostics(),
-    emptyContextMessage: String = "English context will appear here.",
+    remoteMessage: String? = null,
+    emptyContextMessage: String = "",
     stableTranscript: String = "",
     provisionalTranscript: String = "",
     statusMessage: String? = null,
@@ -231,7 +242,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
         Column {
             if (wide) {
                 Row(Modifier.weight(1f)) {
-                    ContextCard(resolvedContextState, summaryDiagnostics, emptyContextMessage, Modifier.weight(contextRatio).fillMaxHeight())
+                    ContextCard(resolvedContextState, summaryDiagnostics, remoteStatus, remoteMessage, emptyContextMessage, Modifier.weight(contextRatio).fillMaxHeight())
                     Splitter(
                         Modifier.fillMaxHeight().width(18.dp),
                         vertical = true,
@@ -240,7 +251,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     TranscriptCard(stableTranscript, provisionalTranscript, Modifier.weight(1f - contextRatio).fillMaxHeight())
                 }
             } else {
-                ContextCard(resolvedContextState, summaryDiagnostics, emptyContextMessage, Modifier.weight(contextRatio).fillMaxWidth())
+                ContextCard(resolvedContextState, summaryDiagnostics, remoteStatus, remoteMessage, emptyContextMessage, Modifier.weight(contextRatio).fillMaxWidth())
                 Splitter(
                     Modifier.fillMaxWidth().height(18.dp),
                     vertical = false,
@@ -251,7 +262,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
             if (statusMessage != null) {
                 Text(statusMessage, color = if (statusIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
-            Controls(recording, recordingAvailable, modelLoading, stopping, elapsedSeconds, intervalSeconds, audioLevel, activeModelId, backend, onIntervalChange, onToggle)
+            Controls(recording, recordingAvailable, modelLoading, stopping, elapsedSeconds, intervalMillis, audioLevel, activeModelId, backend, onIntervalChange, onToggle)
         }
     }
 }
@@ -280,7 +291,14 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
         history = if (details.isEmpty()) emptyList() else listOf(ContextHistoryEntry(ListeningContext(global, details), 0L)),
     )
 
-@Composable private fun ContextCard(contextState: StreamingContextState, diagnostics: SummaryDiagnostics, emptyMessage: String, modifier: Modifier) {
+@Composable private fun ContextCard(
+    contextState: StreamingContextState,
+    diagnostics: SummaryDiagnostics,
+    remoteStatus: RemoteStatus,
+    remoteMessage: String?,
+    emptyMessage: String,
+    modifier: Modifier,
+) {
     val scroll = rememberScrollState()
     var followUpdates by remember { mutableStateOf(true) }
     val current = contextState.current
@@ -307,12 +325,19 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
                 }
             }
             Spacer(Modifier.height(8.dp))
-            Text(heading, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("context-heading"))
-            SummaryDiagnosticsPanel(diagnostics, contextState.isStreaming)
+            if (heading.isNotBlank()) Text(heading, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("context-heading"))
+            englishContextStatus(diagnostics, contextState.isStreaming, remoteStatus, remoteMessage)?.let { status ->
+                Text(
+                    status,
+                    color = if (remoteStatus == RemoteStatus.Ready) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.padding(top = 4.dp).testTag("english-context-status"),
+                )
+            }
             HorizontalDivider(Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
             Column(Modifier.weight(1f).verticalScroll(scroll).testTag("context-history")) {
                 if (contextState.history.isEmpty() && draft == null) {
-                    Text(emptyMessage, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge)
+                    if (emptyMessage.isNotBlank()) Text(emptyMessage, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge)
                 } else {
                     contextState.history.forEach { entry -> ContextHistoryItem(entry.context) }
                     draft?.let { ContextDraftItem(it) }
@@ -320,6 +345,24 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
             }
         }
     }
+}
+
+private fun englishContextStatus(
+    diagnostics: SummaryDiagnostics,
+    streaming: Boolean,
+    remoteStatus: RemoteStatus,
+    remoteMessage: String?,
+): String? {
+    if (!remoteMessage.isNullOrBlank()) return remoteMessage
+    if (streaming) return "Streaming English context"
+    return when (diagnostics.phase) {
+        "Idle" -> null
+        "Waiting for finalized transcript" -> "Waiting for finalized Chinese"
+        "Transcript ready", "OpenRouter request started" -> "Sending summary"
+        "No new finalized transcript" -> "No new finalized Chinese"
+        "Remote summaries disabled" -> "Remote summaries disabled"
+        else -> diagnostics.phase.takeIf { it.isNotBlank() }
+    } ?: if (remoteStatus == RemoteStatus.Ready) null else "English summary remote status: $remoteStatus"
 }
 
 @Composable private fun ContextHistoryItem(context: ListeningContext) {
@@ -365,7 +408,7 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
             Text("Summary trace", style = MaterialTheme.typography.labelLarge)
             Text("Phase: ${diagnostics.phase}", style = MaterialTheme.typography.bodySmall)
             Text(
-                "Cadence ${diagnostics.cadenceSeconds ?: "-"}s · transcript ${diagnostics.transcriptChars} chars · delta ${diagnostics.deltaChars} chars",
+                "Cadence ${diagnostics.cadenceMillis?.formatCadenceMillis() ?: "-"} · transcript ${diagnostics.transcriptChars} chars · delta ${diagnostics.deltaChars} chars",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -422,9 +465,7 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
         Column(Modifier.padding(16.dp)) {
             Text("Traditional Chinese transcript", style = MaterialTheme.typography.titleMedium)
             Column(Modifier.padding(top = 8.dp).weight(1f).verticalScroll(scroll)) {
-                if (stableText.isBlank() && provisionalText.isBlank()) {
-                    Text("Traditional Chinese speech transcribed on this phone will appear here.", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge)
-                } else {
+                if (stableText.isNotBlank() || provisionalText.isNotBlank()) {
                     Text(stableText, style = MaterialTheme.typography.bodyLarge)
                     AnimatedVisibility(visible = provisionalText.isNotBlank(), enter = fadeIn(), exit = fadeOut()) {
                         Text(
@@ -447,7 +488,7 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     modelLoading: Boolean,
     stopping: Boolean,
     elapsed: Long,
-    interval: Int,
+    intervalMillis: Int,
     audioLevel: Float,
     activeModelId: String?,
     backend: InferenceBackend?,
@@ -474,17 +515,35 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
                 }
             }
         }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            SingleChoiceSegmentedButtonRow(Modifier.weight(1f)) {
-                listOf(5, 10).forEachIndexed { index, seconds ->
-                    SegmentedButton(selected = interval == seconds, onClick = { change(seconds) }, shape = SegmentedButtonDefaults.itemShape(index, 2)) { Text("${seconds}s") }
-                }
-            }
+        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+            CadenceSlider(intervalMillis, change, Modifier.weight(1f))
             Button(enabled = !stopping && (recording || recordingAvailable), onClick = toggle, modifier = Modifier.heightIn(min = 48.dp).testTag("record-toggle"), colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)) {
                 AnimatedContent(targetState = when { stopping -> "Finishing…"; modelLoading -> "Cancel"; recording -> "Stop"; recordingAvailable -> "Start"; else -> "Model required" }, label = "record action") { Text(it) }
             }
         }
     }
+}
+
+@Composable private fun CadenceSlider(intervalMillis: Int, change: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val snapped = intervalMillis.snapSummaryCadenceMillis()
+    Column(modifier) {
+        Text("Summary every ${snapped.formatCadenceMillis()}", style = MaterialTheme.typography.labelMedium)
+        Slider(
+            value = snapped.toFloat(),
+            onValueChange = { change(it.toInt().snapSummaryCadenceMillis()) },
+            valueRange = MIN_SUMMARY_CADENCE_MILLIS.toFloat()..MAX_SUMMARY_CADENCE_MILLIS.toFloat(),
+            steps = ((MAX_SUMMARY_CADENCE_MILLIS - MIN_SUMMARY_CADENCE_MILLIS) / SUMMARY_CADENCE_STEP_MILLIS) - 1,
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("cadence-slider")
+                .semantics { contentDescription = "Summary cadence ${snapped.formatCadenceMillis()}" },
+        )
+    }
+}
+
+private fun Int.formatCadenceMillis(): String {
+    val snapped = snapSummaryCadenceMillis()
+    return if (snapped % 1_000 == 0) "${snapped / 1_000}s" else "%.1fs".format(snapped / 1_000f)
 }
 
 @Composable private fun AudioLevelMeter(level: Float) {
@@ -500,22 +559,33 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     }
 }
 
-@Composable private fun SessionsScreen(sessions: List<SessionEntity>, viewModel: ListenerViewModel) {
+@OptIn(ExperimentalLayoutApi::class)
+@Composable private fun SessionsScreen(
+    sessions: List<SessionEntity>,
+    viewModel: ListenerViewModel,
+    summaryDiagnostics: SummaryDiagnostics,
+    summaryStreaming: Boolean,
+) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var editing by remember { mutableStateOf<SessionEntity?>(null) }
     var editingTranscriptSeed by remember { mutableStateOf("") }
     var deleting by remember { mutableStateOf<SessionEntity?>(null) }
-    if (sessions.isEmpty()) {
-        Box(Modifier.fillMaxSize().padding(24.dp)) { Text("Your saved listening sessions will appear here.") }
-    } else {
-        Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    var saveMessage by remember { mutableStateOf<String?>(null) }
+    Column(Modifier.fillMaxSize().padding(horizontal = 16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        SummaryDiagnosticsPanel(summaryDiagnostics, summaryStreaming)
+        saveMessage?.let {
+            Text(it, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall)
+        }
+        if (sessions.isEmpty()) {
+            Text("Your saved listening sessions will appear here.", Modifier.padding(top = 12.dp))
+        } else {
             sessions.forEach { session ->
                 OutlinedCard(Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(16.dp)) {
                         Text(session.title, style = MaterialTheme.typography.titleMedium)
                         Text(if (session.endedAt == null) "In progress" else "Saved", style = MaterialTheme.typography.bodySmall)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                             TextButton(onClick = { scope.launch { editingTranscriptSeed = viewModel.exportSession(session.id); editing = session } }) { Text("Edit") }
                             TextButton(onClick = {
                                 scope.launch {
@@ -523,6 +593,30 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
                                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }, "Export transcript"))
                                 }
                             }) { Text("Export") }
+                            TextButton(onClick = {
+                                scope.launch {
+                                    saveMessage = runCatching {
+                                        val intent = viewModel.createSessionSummaryTraceShareIntent(session.id)
+                                        context.startActivity(Intent.createChooser(intent, "Share summary trace"))
+                                        "Opening share sheet."
+                                    }.getOrElse { error ->
+                                        error.message ?: "Unable to share summary trace."
+                                    }
+                                }
+                            }) {
+                                Icon(painterResource(android.R.drawable.ic_menu_share), contentDescription = null, modifier = Modifier.size(18.dp))
+                                Spacer(Modifier.width(6.dp))
+                                Text("Share trace")
+                            }
+                            TextButton(onClick = {
+                                scope.launch {
+                                    saveMessage = runCatching {
+                                        "Saved ${viewModel.saveSessionSummaryTraceToDownloads(session.id)} to Downloads."
+                                    }.getOrElse { error ->
+                                        error.message ?: "Unable to save summary trace."
+                                    }
+                                }
+                            }) { Text("Save trace") }
                             TextButton(onClick = { deleting = session }) { Text("Delete") }
                         }
                     }
@@ -545,7 +639,7 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
         AlertDialog(
             onDismissRequest = { deleting = null },
             title = { Text("Delete this session?") },
-            text = { Text("The saved transcript and English context will be permanently removed.") },
+            text = { Text("The saved transcript and English summaries will be permanently removed.") },
             confirmButton = { TextButton(onClick = { viewModel.deleteSession(session.id); deleting = null }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
         )

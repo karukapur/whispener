@@ -2,6 +2,11 @@ package com.listener.app.data.session
 
 import androidx.room.*
 import kotlinx.coroutines.flow.Flow
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonPrimitive
+import java.text.DateFormat
+import java.util.Date
 
 @Entity(tableName = "sessions") data class SessionEntity(@PrimaryKey(autoGenerate = true) val id: Long = 0, val title: String, val editedTranscript: String? = null, val startedAt: Long, val endedAt: Long? = null, val updateIntervalSeconds: Int = 5)
 @Entity(tableName = "segments", foreignKeys = [ForeignKey(entity = SessionEntity::class, parentColumns = ["id"], childColumns = ["sessionId"], onDelete = ForeignKey.CASCADE)], indices = [Index("sessionId")])
@@ -43,9 +48,38 @@ class SessionRepository(private val dao: SessionDao) {
     )
     suspend fun finish(id: Long) = dao.finish(id, System.currentTimeMillis())
     suspend fun deleteConfirmed(id: Long, confirmed: Boolean) { if (confirmed) dao.delete(id) }
+    suspend fun summaryTrace(id: Long): String {
+        val session = dao.session(id) ?: return "Session not found."
+        val summaries = dao.summaries(id)
+        return buildString {
+            appendLine("Listener summary trace")
+            appendLine(session.title)
+            appendLine("Started: ${session.startedAt.formatTraceTime()}")
+            appendLine("Ended: ${session.endedAt?.formatTraceTime() ?: "In progress"}")
+            appendLine("Stored interval: ${session.updateIntervalSeconds}s")
+            appendLine()
+            if (summaries.isEmpty()) {
+                appendLine("No English summaries recorded for this session.")
+            } else {
+                summaries.forEachIndexed { index, summary ->
+                    appendLine("${index + 1}. ${summary.createdAt.formatTraceTime()}")
+                    appendLine(summary.globalContext)
+                    summary.details().forEach { detail -> appendLine("- $detail") }
+                    appendLine()
+                }
+            }
+        }.trimEnd()
+    }
     suspend fun export(id: Long): String {
         val edited = dao.session(id)?.editedTranscript
         if (!edited.isNullOrBlank()) return edited
         return dao.segments(id).joinToString("\n") { "[${it.startMs}-${it.endMs}] ${it.displayText ?: it.originalText}" }
     }
 }
+
+private fun Long.formatTraceTime(): String =
+    DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.MEDIUM).format(Date(this))
+
+private fun SummaryEntity.details(): List<String> = runCatching {
+    Json.parseToJsonElement(detailsJson).jsonArray.mapNotNull { it.jsonPrimitive.content.takeIf(String::isNotBlank) }
+}.getOrElse { emptyList() }
