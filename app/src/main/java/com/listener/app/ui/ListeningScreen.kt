@@ -57,6 +57,7 @@ import com.listener.app.data.MIN_SUMMARY_CADENCE_MILLIS
 import com.listener.app.data.SUMMARY_CADENCE_STEP_MILLIS
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
+import com.listener.app.data.minimumSummaryCadenceMillis
 import com.listener.app.data.snapSummaryCadenceMillis
 import com.listener.app.data.session.SessionEntity
 import com.listener.app.speech.InferenceBackend
@@ -162,6 +163,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     audioLevel = state.runtime.audioLevel,
                     activeModelId = state.runtime.activeModelId,
                     backend = state.runtime.backend,
+                    minimumIntervalMillis = minimumSummaryCadenceMillis(state.preferences.selectedModel),
                 )
             }
             composable(Destination.Sessions.route) {
@@ -190,6 +192,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
             composable(Destination.Settings.route) {
                 RemoteSettings(
                     apiKeyPresent = state.apiKeyPresent,
+                    groqApiKeyPresent = state.groqApiKeyPresent,
                     remoteEnabled = state.preferences.remoteEnabled,
                     retentionDays = state.preferences.retentionDays,
                     selectedModel = state.preferences.selectedModel,
@@ -231,6 +234,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     audioLevel: Float = 0f,
     activeModelId: String? = null,
     backend: InferenceBackend? = null,
+    minimumIntervalMillis: Int = MIN_SUMMARY_CADENCE_MILLIS,
 ) {
     val resolvedContextState = contextState ?: legacyContextState(globalContext, details)
     BoxWithConstraints(Modifier.fillMaxSize().padding(16.dp).testTag("adaptive-root")) {
@@ -262,7 +266,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
             if (statusMessage != null) {
                 Text(statusMessage, color = if (statusIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
             }
-            Controls(recording, recordingAvailable, modelLoading, stopping, elapsedSeconds, intervalMillis, audioLevel, activeModelId, backend, onIntervalChange, onToggle)
+            Controls(recording, recordingAvailable, modelLoading, stopping, elapsedSeconds, intervalMillis, minimumIntervalMillis, audioLevel, activeModelId, backend, onIntervalChange, onToggle)
         }
     }
 }
@@ -358,7 +362,7 @@ private fun englishContextStatus(
     return when (diagnostics.phase) {
         "Idle" -> null
         "Waiting for finalized transcript" -> "Waiting for finalized Chinese"
-        "Transcript ready", "OpenRouter request started" -> "Sending summary"
+        "Transcript ready", "OpenRouter request started", "Groq request started" -> "Sending summary"
         "No new finalized transcript" -> "No new finalized Chinese"
         "Remote summaries disabled" -> "Remote summaries disabled"
         else -> diagnostics.phase.takeIf { it.isNotBlank() }
@@ -489,6 +493,7 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     stopping: Boolean,
     elapsed: Long,
     intervalMillis: Int,
+    minimumIntervalMillis: Int,
     audioLevel: Float,
     activeModelId: String?,
     backend: InferenceBackend?,
@@ -516,7 +521,7 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            CadenceSlider(intervalMillis, change, Modifier.weight(1f))
+            CadenceSlider(intervalMillis, minimumIntervalMillis, change, Modifier.weight(1f))
             Button(enabled = !stopping && (recording || recordingAvailable), onClick = toggle, modifier = Modifier.heightIn(min = 48.dp).testTag("record-toggle"), colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)) {
                 AnimatedContent(targetState = when { stopping -> "Finishing…"; modelLoading -> "Cancel"; recording -> "Stop"; recordingAvailable -> "Start"; else -> "Model required" }, label = "record action") { Text(it) }
             }
@@ -524,15 +529,16 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     }
 }
 
-@Composable private fun CadenceSlider(intervalMillis: Int, change: (Int) -> Unit, modifier: Modifier = Modifier) {
-    val snapped = intervalMillis.snapSummaryCadenceMillis()
+@Composable private fun CadenceSlider(intervalMillis: Int, minimumIntervalMillis: Int, change: (Int) -> Unit, modifier: Modifier = Modifier) {
+    val minimum = minimumIntervalMillis.snapSummaryCadenceMillis()
+    val snapped = intervalMillis.coerceAtLeast(minimum).snapSummaryCadenceMillis()
     Column(modifier) {
         Text("Summary every ${snapped.formatCadenceMillis()}", style = MaterialTheme.typography.labelMedium)
         Slider(
             value = snapped.toFloat(),
-            onValueChange = { change(it.toInt().snapSummaryCadenceMillis()) },
-            valueRange = MIN_SUMMARY_CADENCE_MILLIS.toFloat()..MAX_SUMMARY_CADENCE_MILLIS.toFloat(),
-            steps = ((MAX_SUMMARY_CADENCE_MILLIS - MIN_SUMMARY_CADENCE_MILLIS) / SUMMARY_CADENCE_STEP_MILLIS) - 1,
+            onValueChange = { change(it.toInt().coerceAtLeast(minimum).snapSummaryCadenceMillis()) },
+            valueRange = minimum.toFloat()..MAX_SUMMARY_CADENCE_MILLIS.toFloat(),
+            steps = ((MAX_SUMMARY_CADENCE_MILLIS - minimum) / SUMMARY_CADENCE_STEP_MILLIS) - 1,
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("cadence-slider")
@@ -559,7 +565,6 @@ private fun Int.formatCadenceMillis(): String {
     }
 }
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable private fun SessionsScreen(
     sessions: List<SessionEntity>,
     viewModel: ListenerViewModel,
@@ -585,15 +590,15 @@ private fun Int.formatCadenceMillis(): String {
                     Column(Modifier.padding(16.dp)) {
                         Text(session.title, style = MaterialTheme.typography.titleMedium)
                         Text(if (session.endedAt == null) "In progress" else "Saved", style = MaterialTheme.typography.bodySmall)
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                            TextButton(onClick = { scope.launch { editingTranscriptSeed = viewModel.exportSession(session.id); editing = session } }) { Text("Edit") }
-                            TextButton(onClick = {
+                        SessionActions(
+                            onEdit = { scope.launch { editingTranscriptSeed = viewModel.exportSession(session.id); editing = session } },
+                            onExport = {
                                 scope.launch {
                                     val text = viewModel.exportSession(session.id)
                                     context.startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND).apply { type = "text/plain"; putExtra(Intent.EXTRA_TEXT, text) }, "Export transcript"))
                                 }
-                            }) { Text("Export") }
-                            TextButton(onClick = {
+                            },
+                            onShareTrace = {
                                 scope.launch {
                                     saveMessage = runCatching {
                                         val intent = viewModel.createSessionSummaryTraceShareIntent(session.id)
@@ -603,22 +608,9 @@ private fun Int.formatCadenceMillis(): String {
                                         error.message ?: "Unable to share summary trace."
                                     }
                                 }
-                            }) {
-                                Icon(painterResource(android.R.drawable.ic_menu_share), contentDescription = null, modifier = Modifier.size(18.dp))
-                                Spacer(Modifier.width(6.dp))
-                                Text("Share trace")
-                            }
-                            TextButton(onClick = {
-                                scope.launch {
-                                    saveMessage = runCatching {
-                                        "Saved ${viewModel.saveSessionSummaryTraceToDownloads(session.id)} to Downloads."
-                                    }.getOrElse { error ->
-                                        error.message ?: "Unable to save summary trace."
-                                    }
-                                }
-                            }) { Text("Save trace") }
-                            TextButton(onClick = { deleting = session }) { Text("Delete") }
-                        }
+                            },
+                            onDelete = { deleting = session },
+                        )
                     }
                 }
             }
@@ -643,5 +635,31 @@ private fun Int.formatCadenceMillis(): String {
             confirmButton = { TextButton(onClick = { viewModel.deleteSession(session.id); deleting = null }) { Text("Delete") } },
             dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } },
         )
+    }
+}
+
+@Composable internal fun SessionActions(
+    onEdit: () -> Unit,
+    onExport: () -> Unit,
+    onShareTrace: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceEvenly,
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        IconButton(onClick = onEdit, modifier = Modifier.testTag("session-action-edit")) {
+            Icon(painterResource(android.R.drawable.ic_menu_edit), contentDescription = "Edit session")
+        }
+        IconButton(onClick = onExport, modifier = Modifier.testTag("session-action-export")) {
+            Icon(painterResource(android.R.drawable.ic_menu_send), contentDescription = "Export transcript")
+        }
+        IconButton(onClick = onShareTrace, modifier = Modifier.testTag("session-action-share-trace")) {
+            Icon(painterResource(android.R.drawable.ic_menu_share), contentDescription = "Share trace")
+        }
+        IconButton(onClick = onDelete, modifier = Modifier.testTag("session-action-delete")) {
+            Icon(painterResource(android.R.drawable.ic_menu_delete), contentDescription = "Delete session")
+        }
     }
 }

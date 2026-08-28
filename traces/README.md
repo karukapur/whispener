@@ -11,7 +11,7 @@ python3 traces/summarize_trace_for_llm.py
 By default the script:
 
 - Selects the newest `listener-summary-trace-*.txt` file by modified time.
-- Redacts OpenRouter-style secrets defensively.
+- Redacts OpenRouter- and Groq-style secrets defensively.
 - Keeps output around a small character budget.
 - Prioritizes causal signals over repeated runtime noise.
 

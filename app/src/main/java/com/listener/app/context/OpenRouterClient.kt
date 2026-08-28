@@ -16,6 +16,13 @@ data class OpenRouterModel(val id: String, val name: String)
 
 enum class SummaryTransportMode { STREAMING, NON_STREAMING }
 
+enum class RemoteRequestTarget(val displayName: String) {
+    OPENROUTER("OpenRouter"),
+    GROQ("Groq"),
+}
+
+const val GROQ_GPT_OSS_20B_API_MODEL_ID = "openai/gpt-oss-20b"
+
 data class RemoteFailureDiagnostics(
     val responseChars: Int? = null,
     val streamDeltaChars: Int? = null,
@@ -40,6 +47,7 @@ sealed interface RemoteResult<out T> {
 class OpenRouterClient(
     private val http: OkHttpClient = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build(),
     private val baseUrl: String = "https://openrouter.ai/api/v1/",
+    private val requestTarget: RemoteRequestTarget = RemoteRequestTarget.OPENROUTER,
 ) {
     suspend fun fetchFreeModels(apiKey: String): RemoteResult<List<OpenRouterModel>> = withContext(Dispatchers.IO) {
         execute(Request.Builder().url("${baseUrl}models?sort=latency-low-to-high&supported_parameters=structured_outputs").bearer(apiKey).build()) { body ->
@@ -106,10 +114,15 @@ class OpenRouterClient(
                 }
             }
             put("temperature", 0)
-            put("max_tokens", 360)
-            putJsonObject("provider") {
-                put("require_parameters", true)
-                putJsonObject("max_price") { put("prompt", 0); put("completion", 0) }
+            if (requestTarget == RemoteRequestTarget.GROQ) {
+                put("max_completion_tokens", 360)
+                put("reasoning_effort", "low")
+            } else {
+                put("max_tokens", 360)
+                putJsonObject("provider") {
+                    put("require_parameters", true)
+                    putJsonObject("max_price") { put("prompt", 0); put("completion", 0) }
+                }
             }
         }.toString()
         val request = Request.Builder().url("${baseUrl}chat/completions").bearer(apiKey)
@@ -179,7 +192,7 @@ class OpenRouterClient(
                 }
                 if (eventType == "error") {
                     val error = sseError(data)
-                    val message = error.message ?: "OpenRouter sent an SSE error; keeping the last context."
+                    val message = error.message ?: "${requestTarget.displayName} sent an SSE error; keeping the last context."
                     return RemoteResult.Failure(
                         status = if (message.contains("No endpoints found", ignoreCase = true)) RemoteStatus.ModelUnavailable else RemoteStatus.InvalidResponse,
                         message = message,
@@ -216,11 +229,11 @@ class OpenRouterClient(
             RemoteResult.Success(finalContext)
         }
     } catch (_: SocketTimeoutException) {
-        RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
+        RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
     } catch (_: InterruptedIOException) {
-        RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
+        RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
     } catch (_: IOException) {
-        RemoteResult.Failure(RemoteStatus.Offline, "OpenRouter is unavailable; local transcription is still active.")
+        RemoteResult.Failure(RemoteStatus.Offline, "${requestTarget.displayName} is unavailable; local transcription is still active.")
     }
 
     private fun executeNonStreaming(request: Request): RemoteResult<ListeningContext> = try {
@@ -244,19 +257,19 @@ class OpenRouterClient(
             RemoteResult.Success(finalContext)
         }
     } catch (_: SocketTimeoutException) {
-        RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
+        RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
     } catch (_: InterruptedIOException) {
-        RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
+        RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
     } catch (_: IOException) {
-        RemoteResult.Failure(RemoteStatus.Offline, "OpenRouter is unavailable; local transcription is still active.")
+        RemoteResult.Failure(RemoteStatus.Offline, "${requestTarget.displayName} is unavailable; local transcription is still active.")
     }
 
     private fun httpFailure(code: Int, body: String): RemoteResult.Failure = when (code) {
-        401 -> RemoteResult.Failure(RemoteStatus.InvalidKey, "OpenRouter rejected this API key.")
-        408 -> RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
-        404 -> RemoteResult.Failure(RemoteStatus.ModelUnavailable, openRouterError(body) ?: "The selected OpenRouter model is unavailable for this request.")
-        429 -> RemoteResult.Failure(RemoteStatus.RateLimited, "The free OpenRouter quota is currently unavailable.")
-        else -> RemoteResult.Failure(RemoteStatus.InvalidResponse, "OpenRouter returned HTTP $code.")
+        401 -> RemoteResult.Failure(RemoteStatus.InvalidKey, "${requestTarget.displayName} rejected this API key.")
+        408 -> RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
+        404 -> RemoteResult.Failure(RemoteStatus.ModelUnavailable, openRouterError(body) ?: "The selected ${requestTarget.displayName} model is unavailable for this request.")
+        429 -> RemoteResult.Failure(RemoteStatus.RateLimited, "The free ${requestTarget.displayName} quota is currently unavailable.")
+        else -> RemoteResult.Failure(RemoteStatus.InvalidResponse, "${requestTarget.displayName} returned HTTP $code.")
     }
 
     private fun streamChunk(data: String): StreamChunk = runCatching {
@@ -339,7 +352,7 @@ class OpenRouterClient(
     ): RemoteResult.Failure =
         RemoteResult.Failure(
             RemoteStatus.InvalidResponse,
-            "OpenRouter returned a response that could not be used; keeping the last context.",
+            "${requestTarget.displayName} returned a response that could not be used; keeping the last context.",
             failureDiagnostics(
                 response = response,
                 streamDeltaChars = streamDeltaChars,
@@ -387,6 +400,27 @@ class OpenRouterClient(
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
         private const val SAFE_RESPONSE_EXCERPT_CHARS = 160
     }
+}
+
+class GroqClient(
+    http: OkHttpClient = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build(),
+    baseUrl: String = "https://api.groq.com/openai/v1/",
+) {
+    private val delegate = OpenRouterClient(http, baseUrl, RemoteRequestTarget.GROQ)
+
+    suspend fun summarize(
+        apiKey: String,
+        priorEnglishContext: String,
+        continuityChineseTail: String,
+        newChineseText: String,
+    ): RemoteResult<ListeningContext> = delegate.summarize(
+        apiKey = apiKey,
+        model = GROQ_GPT_OSS_20B_API_MODEL_ID,
+        priorEnglishContext = priorEnglishContext,
+        continuityChineseTail = continuityChineseTail,
+        newChineseText = newChineseText,
+        transportMode = SummaryTransportMode.NON_STREAMING,
+    )
 }
 
 class SummaryCoordinator(initial: ListeningContext? = null) {

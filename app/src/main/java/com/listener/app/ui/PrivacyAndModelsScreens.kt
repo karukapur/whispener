@@ -4,20 +4,25 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.animateColorAsState
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.listener.app.context.OpenRouterModel
+import com.listener.app.topRemoteModelOptions
 import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
+import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
 import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
@@ -37,7 +42,7 @@ import com.listener.app.speech.InferenceBackend
         OutlinedCard(Modifier.fillMaxWidth()) {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("Optional English context", style = MaterialTheme.typography.titleMedium)
-                Text("If enabled, finalized Chinese text, recent transcript text, and the previous English context are sent to your selected OpenRouter model. Your API key is encrypted on this phone.")
+                Text("If enabled, finalized Chinese text, recent transcript text, and the previous English context are sent to your selected OpenRouter or Groq model. Audio stays on this device.")
             }
         }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -51,8 +56,10 @@ import com.listener.app.speech.InferenceBackend
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable fun RemoteSettings(
     apiKeyPresent: Boolean,
+    groqApiKeyPresent: Boolean,
     remoteEnabled: Boolean,
     retentionDays: Int,
     selectedModel: String?,
@@ -67,15 +74,17 @@ import com.listener.app.speech.InferenceBackend
     onSelectRemoteModel: (String) -> Unit,
 ) {
     var key by remember { mutableStateOf("") }
+    var modelMenuExpanded by remember { mutableStateOf(false) }
     var retentionSelection by remember(retentionDays) { mutableFloatStateOf(retentionDays.toFloat()) }
-    val modelOptions = remember(catalog) {
-        if (catalog.any { it.id == OPENROUTER_FREE_ROUTER_MODEL_ID }) {
-            catalog
-        } else {
-            listOf(OpenRouterModel(OPENROUTER_FREE_ROUTER_MODEL_ID, "OpenRouter free router")) + catalog
-        }
-    }
     val currentModel = selectedModel ?: DEFAULT_OPENROUTER_MODEL_ID
+    val modelOptions = remember(catalog, currentModel, groqApiKeyPresent) {
+        topRemoteModelOptions(catalog, currentModel, groqApiKeyPresent)
+    }
+    val currentModelDetails = modelOptions.firstOrNull { it.id == currentModel }
+        ?: OpenRouterModel(currentModel, currentModel)
+    LaunchedEffect(apiKeyPresent) {
+        if (apiKeyPresent) onRefreshCatalog()
+    }
     Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("Remote English context", style = MaterialTheme.typography.headlineSmall)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -95,43 +104,139 @@ import com.listener.app.speech.InferenceBackend
             if (apiKeyPresent) TextButton(onClick = onClearKey) { Text("Remove key") }
         }
         HorizontalDivider()
-        Text("OpenRouter free routing is used for English context summaries.", style = MaterialTheme.typography.bodySmall)
+        Text("Choose Groq GPT-OSS 20B, a specific low-latency OpenRouter model, or OpenRouter's automatic free router.", style = MaterialTheme.typography.bodySmall)
+        if (groqApiKeyPresent) {
+            Text("Groq GPT-OSS 20B is available from this debug build's local properties.", style = MaterialTheme.typography.bodySmall)
+        }
         message?.let { Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall) }
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
             Column(Modifier.weight(1f)) {
                 Text("Summary model", style = MaterialTheme.typography.titleMedium)
-                Text(currentModel, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text("Five compatible free models are ranked by OpenRouter latency.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             TextButton(enabled = apiKeyPresent && !catalogLoading, onClick = onRefreshCatalog) {
                 Text(if (catalogLoading) "Refreshing" else "Refresh")
             }
         }
-        modelOptions.forEach { model ->
-            Row(
-                Modifier
-                    .fillMaxWidth()
-                    .selectable(
-                        selected = currentModel == model.id,
-                        role = Role.RadioButton,
-                        onClick = { onSelectRemoteModel(model.id) },
+        ExposedDropdownMenuBox(
+            expanded = modelMenuExpanded,
+            onExpandedChange = { modelMenuExpanded = it },
+        ) {
+            OutlinedTextField(
+                value = remoteModelFieldName(currentModelDetails),
+                onValueChange = {},
+                readOnly = true,
+                label = { Text("Selected model") },
+                supportingText = { Text(currentModelDetails.id) },
+                leadingIcon = {
+                    RemoteModelBrandMarks(
+                        model = currentModelDetails,
+                        openAiContentDescription = "OpenAI",
                     )
-                    .padding(vertical = 6.dp),
-                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                },
+                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = modelMenuExpanded) },
+                modifier = Modifier
+                    .menuAnchor(ExposedDropdownMenuAnchorType.PrimaryNotEditable)
+                    .fillMaxWidth(),
+            )
+            ExposedDropdownMenu(
+                expanded = modelMenuExpanded,
+                onDismissRequest = { modelMenuExpanded = false },
             ) {
-                RadioButton(selected = currentModel == model.id, onClick = null)
-                Column(Modifier.padding(start = 8.dp)) {
-                    Text(model.name, style = MaterialTheme.typography.bodyMedium)
-                    Text(model.id, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                modelOptions.forEach { model ->
+                    DropdownMenuItem(
+                        text = {
+                            Column {
+                                RemoteModelLabel(model)
+                                Text(
+                                    if (model.id == OPENROUTER_FREE_ROUTER_MODEL_ID) {
+                                        "${model.id} · randomly selects a compatible free model"
+                                    } else if (model.id == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+                                        "Groq · fixed model · 2s minimum cadence"
+                                    } else {
+                                        model.id
+                                    },
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        },
+                        onClick = {
+                            onSelectRemoteModel(model.id)
+                            modelMenuExpanded = false
+                        },
+                        leadingIcon = {
+                            RadioButton(selected = currentModel == model.id, onClick = null)
+                        },
+                    )
                 }
             }
         }
-        Text("Every interval containing new finalized text creates one OpenRouter request. HTTP 429 keeps the last valid context and never stops local recording.", style = MaterialTheme.typography.bodySmall)
+        Text("Every interval containing new finalized text creates one request to the selected remote provider. HTTP 429 keeps the last valid context and never stops local recording.", style = MaterialTheme.typography.bodySmall)
         HorizontalDivider()
         Text("Local privacy", style = MaterialTheme.typography.titleMedium)
         Text("Audio stays in memory and is never saved. Completed sessions are retained for ${retentionSelection.toInt()} days.")
         Slider(retentionSelection, { retentionSelection = it }, onValueChangeFinished = { onRetentionDays(retentionSelection.toInt()) }, valueRange = 0f..90f, steps = 89)
     }
 }
+
+@Composable
+private fun RemoteModelLabel(model: OpenRouterModel) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(RemoteModelLogoSpacing),
+    ) {
+        RemoteModelBrandMarks(model)
+        Text(remoteModelDisplayName(model), style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable
+private fun RemoteModelBrandMarks(
+    model: OpenRouterModel,
+    openAiContentDescription: String? = null,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(RemoteModelLogoSpacing),
+    ) {
+        if (model.id == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+            Image(
+                painter = painterResource(com.listener.app.R.drawable.ic_brand_groq_wordmark),
+                contentDescription = "Groq",
+                modifier = Modifier.size(width = GroqWordmarkWidth, height = RemoteModelLogoSize),
+            )
+            Text(
+                text = "|",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.outline,
+            )
+            Icon(
+                painter = painterResource(com.listener.app.R.drawable.ic_brand_openai),
+                contentDescription = openAiContentDescription,
+                modifier = Modifier.size(RemoteModelLogoSize),
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
+        } else {
+            Icon(
+                painter = painterResource(com.listener.app.R.drawable.ic_brand_openrouter),
+                contentDescription = "OpenRouter",
+                modifier = Modifier.size(RemoteModelLogoSize),
+                tint = MaterialTheme.colorScheme.onSurface,
+            )
+        }
+    }
+}
+
+private fun remoteModelDisplayName(model: OpenRouterModel): String =
+    if (model.id == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "OpenAI GPT-OSS 20B" else model.name
+
+private fun remoteModelFieldName(model: OpenRouterModel): String =
+    if (model.id == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "GPT-OSS 20B" else model.name
+
+private val RemoteModelLogoSize = 18.dp
+private val RemoteModelLogoSpacing = 6.dp
+private val GroqWordmarkWidth = 48.dp
 
 @Composable fun ModelManagementScreen(
     activeId: String?,

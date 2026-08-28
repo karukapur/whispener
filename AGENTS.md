@@ -2,7 +2,7 @@
 
 ## Mission
 
-Listener is an Android beta for helping an English-speaking listener understand live Chinese speech. Audio is captured on device, transcribed locally, and never written to disk or uploaded. The English side is a live context summary produced from finalized Chinese transcript text through OpenRouter; it is not a full line-by-line translation transcript.
+Listener is an Android beta for helping an English-speaking listener understand live Chinese speech. Audio is captured on device, transcribed locally, and never written to disk or uploaded. The English side is a live context summary produced from finalized Chinese transcript text through the selected OpenRouter or Groq provider; it is not a full line-by-line translation transcript.
 
 Treat privacy, traceability, and device-realistic latency as first-class requirements. When the Chinese transcript works but English context is missing, debug the remote summary decision path before touching speech capture.
 
@@ -18,14 +18,14 @@ Treat privacy, traceability, and device-realistic latency as first-class require
 - Room session storage: `app/src/main/java/com/listener/app/data/session/`
 - Exported user/debug traces: `traces/`
 
-The local model selection and remote summary model selection are intentionally separate. Sherpa/Whisper/Android speech engines decide how Chinese text is produced locally. OpenRouter model ids decide how finalized Chinese text becomes English context.
+The local model selection and remote summary selection are intentionally separate. Sherpa/Whisper/Android speech engines decide how Chinese text is produced locally. OpenRouter model ids or the fixed Groq GPT-OSS option decide how finalized Chinese text becomes English context.
 
 ## Core Runtime Flow
 
 1. `ListenerViewModel.startRecording` records the current preferences and starts the selected local speech service.
 2. `ListeningService` or `PlatformSpeechService` updates `ListeningRuntime.state` with stable/provisional Chinese transcript text.
 3. The summary scheduler wakes on the configured cadence and calls `sendSummaryIfNeeded`.
-4. Summary requests require all of these: remote summaries enabled, OpenRouter key present, selected remote model present, and nonblank finalized Chinese text.
+4. Summary requests require all of these: remote summaries enabled, the selected provider's key present, a selected remote model, and nonblank finalized Chinese text.
 5. Successful remote output is parsed into `ListeningContext`, committed to `StreamingContextState`, and persisted to the current session.
 6. Failed remote output must not stop recording and must not mark Chinese text as successfully summarized.
 
@@ -35,12 +35,22 @@ The local model selection and remote summary model selection are intentionally s
 
 - Default remote model: `openrouter/free`.
 - Keep `openrouter/free` available even when the fetched catalog is empty or stale.
+- In Settings, show up to five free text models in OpenRouter's latency order after filtering for structured-output compatibility; do not hard-code provider model ids.
+- Preserve the user's selected compatible model when it falls outside the displayed top five, and use that exact id for English-context requests.
 - If a selected remote model returns `ModelUnavailable` or a message containing `No endpoints found`, retry once with `openrouter/free`.
 - If the fallback succeeds, commit the context and persist `openrouter/free` as the selected remote model.
 - If the fallback fails, keep the previous selected model and surface the error as an English-context status, not as a local recording/start failure.
 - `remoteMessage` is about remote English context. Local recording status should be driven by microphone/model/service state.
 
 OpenRouter free-model availability changes over time. Do not hard-code a specific free provider model as the availability guarantee.
+
+## Groq Policy
+
+- Groq is a separate provider option backed by `openai/gpt-oss-20b`, not an OpenRouter model alias.
+- Debug builds may read `GROQ_API_KEY` from Gradle, the environment, or `local.properties`; release builds keep the field empty.
+- Use strict non-streaming structured output with low reasoning effort because Groq does not combine streaming with structured output.
+- Selecting Groq raises any lower stored summary cadence to 2 seconds and constrains the slider to 2–10 seconds. Other providers retain 500 ms–10 s.
+- If Groq reports model unavailability and an OpenRouter key exists, the existing one-time `openrouter/free` fallback may run. Other Groq failures keep local transcription active and leave `lastSentTranscript` unchanged.
 
 ## Trace Debugging
 
@@ -49,7 +59,7 @@ Use the newest file in `traces/` first:
 ```sh
 ls -lt traces
 sed -n '1,140p' traces/<latest-trace>.txt
-rg -n "summary_attempt|openrouter|remoteEnabled|selectedRemoteModel|summary_response" traces/<latest-trace>.txt
+rg -n "summary_attempt|openrouter|groq|remoteEnabled|selectedRemoteModel|summary_response" traces/<latest-trace>.txt
 ```
 
 Important trace fields:
@@ -59,6 +69,7 @@ Important trace fields:
 - `stableTranscriptChars`, `provisionalTranscriptChars`: finalized versus provisional Chinese text.
 - `summary_attempt_skipped reason=...`: local decision gate prevented a remote call.
 - `openrouter_request_started`: the app sent a remote request.
+- `groq_request_started`: the app sent a strict non-streaming GPT-OSS 20B request directly to Groq.
 - `openrouter_first_streaming_draft`: first parseable streamed English context.
 - `summary_response_committed`: English context was accepted and persisted.
 - `summary_response_failed`: remote/API/parsing failure; local transcription may still be healthy.
@@ -68,7 +79,8 @@ For the common "Chinese works, English missing" report, classify the trace befor
 
 - `remote_summaries_disabled`: preference/setup issue.
 - `missing_openrouter_key`: credential issue.
-- `missing_openrouter_model`: remote model selection issue.
+- `missing_groq_key`: the Groq option is selected but the debug build has no Groq key.
+- `missing_remote_model`: remote model selection issue.
 - `stable_transcript_empty`: local transcript has not finalized enough text.
 - `stable_transcript_unchanged_since_last_sent`: no new finalized Chinese since the last valid summary.
 - `ModelUnavailable` / `No endpoints found`: remote model endpoint issue; prefer router fallback.

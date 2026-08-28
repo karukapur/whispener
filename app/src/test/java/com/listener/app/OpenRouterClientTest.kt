@@ -74,6 +74,27 @@ class OpenRouterClientTest {
         assertTrue(server.takeRequest().body.readUtf8().contains(""""model":"openrouter/free""""))
     }
 
+    @Test fun groqGptOssUsesStrictNonStreamingLowReasoningRequest() = runTest {
+        server.enqueue(MockResponse().setBody(
+            """{"choices":[{"message":{"content":"{\"globalContext\":\"Fast context\",\"details\":[\"One detail\"]}"},"finish_reason":"stop"}]}""",
+        ))
+        val groq = GroqClient(baseUrl = server.url("openai/v1/").toString())
+
+        val result = groq.summarize("gsk-secret", "", "中文", "新的中文") as RemoteResult.Success<ListeningContext>
+
+        assertEquals("Fast context", result.value.globalContext)
+        val request = server.takeRequest()
+        assertEquals("Bearer gsk-secret", request.getHeader("Authorization"))
+        assertEquals("/openai/v1/chat/completions", request.path)
+        val body = request.body.readUtf8()
+        assertTrue(body.contains("\"model\":\"openai/gpt-oss-20b\""))
+        assertTrue(body.contains("\"stream\":false"))
+        assertTrue(body.contains("\"strict\":true"))
+        assertTrue(body.contains("\"max_completion_tokens\":360"))
+        assertTrue(body.contains("\"reasoning_effort\":\"low\""))
+        assertFalse(body.contains("\"provider\""))
+    }
+
     @Test fun summaryPromptUsesDeltaTailAndPreviousJson() = runTest {
         server.enqueue(sse("""{"globalContext":"Planning lunch","details":["They are choosing a restaurant","One person prefers noodles"]}"""))
         val continuityTail = "尾".repeat(800)

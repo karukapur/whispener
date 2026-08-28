@@ -10,5 +10,6 @@ class ApiKeyStore(context: Context) {
     fun save(key: String) { require(key.isNotBlank()); prefs.edit().putString("openrouter", key.trim()).apply() }
     fun read(): String? = prefs.getString("openrouter", null)
         ?: BuildConfig.OPENROUTER_API_KEY.trim().takeIf { it.isNotBlank() }
+    fun readGroq(): String? = BuildConfig.GROQ_API_KEY.trim().takeIf { it.isNotBlank() }
     fun clear() = prefs.edit().remove("openrouter").apply()
 }

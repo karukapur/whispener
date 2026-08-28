@@ -29,7 +29,7 @@ TIMESTAMPED_LINE = re.compile(
     r"(?P<label>[A-Za-z0-9_]+)(?: (?P<fields>.*))?$"
 )
 FIELD_START = re.compile(r"(?<!\S)([A-Za-z][A-Za-z0-9]*)=")
-SECRET = re.compile(r"(?i)(bearer\s+|sk-or-v1-)[A-Za-z0-9._-]+")
+SECRET = re.compile(r"(?i)(bearer\s+|sk-or-v1-|gsk[_-])[A-Za-z0-9._-]+")
 DEFAULT_BUDGET_CHARS = 4500
 INTERESTING_FIELDS = [
     "reason",

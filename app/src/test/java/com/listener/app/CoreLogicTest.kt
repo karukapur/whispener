@@ -4,11 +4,14 @@ import com.listener.app.audio.*
 import com.listener.app.context.*
 import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
 import com.listener.app.data.DEFAULT_SUMMARY_CADENCE_MILLIS
+import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
+import com.listener.app.data.GROQ_MIN_SUMMARY_CADENCE_MILLIS
 import com.listener.app.data.ListenerPreferences
 import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
 import com.listener.app.data.cadenceMillisPreference
+import com.listener.app.data.minimumSummaryCadenceMillis
 import com.listener.app.data.snapSummaryCadenceMillis
 import com.listener.app.data.toSummaryIntervalSeconds
 import com.listener.app.models.ModelManager
@@ -82,7 +85,11 @@ class CoreLogicTest {
         var state = SummaryState(); repeat(100) { state = state.append("x".repeat(100), 500) }
         assertTrue(state.recent.sumOf(String::length) <= 500); assertEquals(3, state.compact("summary").recent.size)
     }
-    @Test fun keysAreRedacted() { assertFalse(SecretRedactor.redact("Bearer abc.def sk-or-v1-secret").contains("secret")) }
+    @Test fun keysAreRedacted() {
+        val redacted = SecretRedactor.redact("Bearer abc.def sk-or-v1-secret gsk_groq-secret")
+        assertFalse(redacted.contains("secret"))
+        assertFalse(redacted.contains("gsk_"))
+    }
     @Test fun lifecycleStopsFromRecordingAndInterruption() {
         assertEquals(RecordingState.STOPPING, reduce(RecordingState.RECORDING, RecordingEvent.Stop))
         assertEquals(RecordingState.STOPPING, reduce(RecordingState.INTERRUPTED, RecordingEvent.Stop))
@@ -262,11 +269,45 @@ class CoreLogicTest {
         )
     }
 
+    @Test fun remoteModelOptionsKeepRouterFiveFastestAndCurrentSelection() {
+        val catalog = (1..7).map { OpenRouterModel("free/model-$it", "Model $it") }
+
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID, "free/model-1", "free/model-2", "free/model-3", "free/model-4", "free/model-5"),
+            topRemoteModelOptions(catalog, OPENROUTER_FREE_ROUTER_MODEL_ID).map { it.id },
+        )
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID, "free/model-1", "free/model-2", "free/model-3", "free/model-4", "free/model-5", "free/model-7"),
+            topRemoteModelOptions(catalog, "free/model-7").map { it.id },
+        )
+    }
+
+    @Test fun remoteModelOptionsPreserveStoredSelectionWhileCatalogIsUnavailable() {
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID, "free/stored-model"),
+            topRemoteModelOptions(emptyList(), "free/stored-model").map { it.id },
+        )
+    }
+
+    @Test fun groqOptionAndCadenceMinimumAreProviderSpecific() {
+        assertEquals(
+            listOf(OPENROUTER_FREE_ROUTER_MODEL_ID, GROQ_GPT_OSS_20B_REMOTE_MODEL_ID, "free/model"),
+            topRemoteModelOptions(
+                catalog = listOf(OpenRouterModel("free/model", "Free model")),
+                selectedModel = OPENROUTER_FREE_ROUTER_MODEL_ID,
+                groqAvailable = true,
+            ).map { it.id },
+        )
+        assertEquals(GROQ_MIN_SUMMARY_CADENCE_MILLIS, minimumSummaryCadenceMillis(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID))
+        assertEquals(com.listener.app.data.MIN_SUMMARY_CADENCE_MILLIS, minimumSummaryCadenceMillis("free/model"))
+    }
+
     @Test fun modelUnavailableRetriesWithFreeRouterOnlyWhenUseful() {
         val unavailable = RemoteResult.Failure(RemoteStatus.ModelUnavailable, "No endpoints found for nvidia/nemotron-nano-9b-v2:free.")
         val invalid = RemoteResult.Failure(RemoteStatus.InvalidResponse, "Malformed JSON")
 
         assertTrue(shouldRetrySummaryWithFreeRouter("nvidia/nemotron-nano-9b-v2:free", unavailable))
+        assertTrue(shouldRetrySummaryWithFreeRouter(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID, unavailable))
         assertFalse(shouldRetrySummaryWithFreeRouter(OPENROUTER_FREE_ROUTER_MODEL_ID, unavailable))
         assertFalse(shouldRetrySummaryWithFreeRouter("free/model", invalid))
     }

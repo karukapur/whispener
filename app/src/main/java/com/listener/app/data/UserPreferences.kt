@@ -10,6 +10,8 @@ private val Context.listenerDataStore by preferencesDataStore("listener_preferen
 
 const val OPENROUTER_FREE_ROUTER_MODEL_ID = "openrouter/free"
 const val DEFAULT_OPENROUTER_MODEL_ID = OPENROUTER_FREE_ROUTER_MODEL_ID
+const val GROQ_GPT_OSS_20B_REMOTE_MODEL_ID = "groq/openai/gpt-oss-20b"
+const val GROQ_MIN_SUMMARY_CADENCE_MILLIS = 2_000
 const val MIN_SUMMARY_CADENCE_MILLIS = 500
 const val MAX_SUMMARY_CADENCE_MILLIS = 10_000
 const val SUMMARY_CADENCE_STEP_MILLIS = 500
@@ -86,7 +88,13 @@ class UserPreferences(private val context: Context) {
 
     suspend fun setRemoteEnabled(enabled: Boolean) = context.listenerDataStore.edit { it[Keys.remote] = enabled }
     suspend fun setRetentionDays(days: Int) = context.listenerDataStore.edit { it[Keys.retention] = days.coerceIn(0, 90) }
-    suspend fun setSelectedModel(id: String) = context.listenerDataStore.edit { it[Keys.model] = id }
+    suspend fun setSelectedModel(id: String, minimumCadenceMillis: Int = MIN_SUMMARY_CADENCE_MILLIS) = context.listenerDataStore.edit {
+        it[Keys.model] = id
+        val currentCadence = cadenceMillisPreference(it[Keys.cadenceMillis], it[Keys.cadenceSeconds])
+        if (currentCadence < minimumCadenceMillis) {
+            it[Keys.cadenceMillis] = minimumCadenceMillis.snapSummaryCadenceMillis()
+        }
+    }
     suspend fun clearSelectedModel() = context.listenerDataStore.edit { it.remove(Keys.model) }
     suspend fun setSelectedLocalModel(id: String) = context.listenerDataStore.edit { it[Keys.localModel] = id }
     suspend fun clearSelectedLocalModel() = context.listenerDataStore.edit { it.remove(Keys.localModel) }
@@ -108,3 +116,6 @@ fun Int.snapSummaryCadenceMillis(): Int {
 
 fun Int.toSummaryIntervalSeconds(): Int =
     (snapSummaryCadenceMillis() + 999) / 1_000
+
+fun minimumSummaryCadenceMillis(remoteModelId: String?): Int =
+    if (remoteModelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) GROQ_MIN_SUMMARY_CADENCE_MILLIS else MIN_SUMMARY_CADENCE_MILLIS

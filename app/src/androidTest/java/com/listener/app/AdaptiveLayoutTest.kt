@@ -1,13 +1,18 @@
 package com.listener.app
 
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.material3.MaterialTheme
 import com.listener.app.context.ListeningContext
+import com.listener.app.context.OpenRouterModel
+import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
 import com.listener.app.speech.InferenceBackend
 import com.listener.app.ui.ListeningScreen
 import com.listener.app.ui.ModelManagementScreen
+import com.listener.app.ui.RemoteSettings
+import com.listener.app.ui.SessionActions
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -121,6 +126,24 @@ class AdaptiveLayoutTest {
         }
     }
 
+    @Test fun groqCadenceSliderCannotGoBelowTwoSeconds() {
+        var selected = 0
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 500,
+                onIntervalChange = { selected = it },
+                onToggle = {},
+                minimumIntervalMillis = 2_000,
+            )
+        }
+
+        compose.onNodeWithText("Summary every 2s").assertExists()
+        compose.onNodeWithContentDescription("Summary cadence 2s").performTouchInput { swipeRight() }
+        compose.runOnIdle { assertTrue(selected >= 2_000) }
+    }
+
     @Test fun remoteErrorsStayInsideEnglishContextPanel() {
         setTestContent {
             ListeningScreen(
@@ -137,6 +160,51 @@ class AdaptiveLayoutTest {
         compose.onNodeWithTag("english-context-status").assertExists()
         compose.onNodeWithText("No endpoints found for nvidia/nemotron-nano-9b-v2:free.").assertExists()
         compose.onNodeWithText("Recording  00:02").assertExists()
+    }
+
+    @Test fun remoteSettingsDropdownShowsFiveFastestCompatibleModelsAndSelectsOne() {
+        val selected = mutableStateOf("openrouter/free")
+        val catalog = (1..7).map { OpenRouterModel("free/model-$it", "Fast model $it") }
+        setTestContent {
+            MaterialTheme {
+                RemoteSettings(
+                    apiKeyPresent = false,
+                    groqApiKeyPresent = true,
+                    remoteEnabled = true,
+                    retentionDays = 30,
+                    selectedModel = selected.value,
+                    catalog = catalog,
+                    catalogLoading = false,
+                    message = null,
+                    onSaveKey = {},
+                    onClearKey = {},
+                    onRemoteEnabled = {},
+                    onRetentionDays = {},
+                    onRefreshCatalog = {},
+                    onSelectRemoteModel = { selected.value = it },
+                )
+            }
+        }
+
+        compose.onNodeWithText("OpenRouter free router").performClick()
+        compose.onNodeWithText("Fast model 5").assertExists()
+        compose.onNodeWithText("Fast model 6").assertDoesNotExist()
+        compose.onNodeWithText("Groq · GPT-OSS 20B").assertExists().performClick()
+        compose.runOnIdle { assertEquals(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID, selected.value) }
+    }
+
+    @Test fun sessionActionsAreOneAccessibleIconRowWithoutSaveTrace() {
+        setTestContent {
+            MaterialTheme {
+                SessionActions({}, {}, {}, {})
+            }
+        }
+
+        compose.onNodeWithContentDescription("Edit session").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Export transcript").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Share trace").assertIsDisplayed()
+        compose.onNodeWithContentDescription("Delete session").assertIsDisplayed()
+        compose.onNodeWithText("Save trace").assertDoesNotExist()
     }
 
     @Test fun modelCardsAreSingleChoiceAndLockedDuringRecording() {

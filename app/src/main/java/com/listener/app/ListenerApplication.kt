@@ -5,6 +5,7 @@ import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import com.listener.app.context.ApiKeyStore
+import com.listener.app.context.GroqClient
 import com.listener.app.context.OpenRouterClient
 import com.listener.app.data.UserPreferences
 import com.listener.app.data.session.DatabaseProvider
@@ -23,6 +24,7 @@ class ListenerApplication : Application() {
     val keyStore by lazy { ApiKeyStore(this) }
     val models by lazy { ModelRepository(this, database.sessions()) }
     val openRouter by lazy { OpenRouterClient() }
+    val groq by lazy { GroqClient() }
 
     override fun onCreate() {
         super.onCreate()

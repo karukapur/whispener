@@ -22,6 +22,13 @@ val openRouterApiKey: String =
         ?: localProperties.getProperty("openrouter.apiKey")
         ?: ""
 
+val groqApiKey: String =
+    providers.gradleProperty("GROQ_API_KEY").orNull
+        ?: providers.environmentVariable("GROQ_API_KEY").orNull
+        ?: localProperties.getProperty("GROQ_API_KEY")
+        ?: localProperties.getProperty("groq.apiKey")
+        ?: ""
+
 android {
     namespace = "com.listener.app"
     compileSdk = 35
@@ -45,10 +52,12 @@ android {
     buildTypes {
         debug {
             buildConfigField("String", "OPENROUTER_API_KEY", openRouterApiKey.asBuildConfigLiteral())
+            buildConfigField("String", "GROQ_API_KEY", groqApiKey.asBuildConfigLiteral())
             externalNativeBuild { cmake { arguments += "-DCMAKE_BUILD_TYPE=Release" } }
         }
         release {
             buildConfigField("String", "OPENROUTER_API_KEY", "\"\"")
+            buildConfigField("String", "GROQ_API_KEY", "\"\"")
             isMinifyEnabled = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
             externalNativeBuild { cmake { arguments += "-DCMAKE_BUILD_TYPE=Release" } }

@@ -138,6 +138,6 @@ private fun List<String>.takeLastWhileBudget(limit: Int): List<String> {
 }
 
 object SecretRedactor {
-    private val tokens = Regex("(?i)(bearer\\s+|sk-or-v1-)[A-Za-z0-9._-]+")
+    private val tokens = Regex("(?i)(bearer\\s+|sk-or-v1-|gsk[_-])[A-Za-z0-9._-]+")
     fun redact(value: String) = value.replace(tokens) { if (it.value.startsWith("Bearer", true)) "Bearer [REDACTED]" else "[REDACTED]" }
 }

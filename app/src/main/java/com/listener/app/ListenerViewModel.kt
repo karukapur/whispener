@@ -2,13 +2,9 @@ package com.listener.app
 
 import android.app.Application
 import android.content.ClipData
-import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.provider.MediaStore
 import android.util.Log
 import androidx.core.content.ContextCompat
 import androidx.core.content.FileProvider
@@ -22,10 +18,12 @@ import com.listener.app.audio.ListenerRuntimeState
 import com.listener.app.audio.PlatformSpeechService
 import com.listener.app.context.*
 import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
+import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
 import com.listener.app.data.ListenerPreferences
 import com.listener.app.data.OPENROUTER_FREE_ROUTER_MODEL_ID
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
+import com.listener.app.data.minimumSummaryCadenceMillis
 import com.listener.app.data.toSummaryIntervalSeconds
 import com.listener.app.data.session.ModelMetadataEntity
 import com.listener.app.data.session.SessionEntity
@@ -56,6 +54,7 @@ data class ListenerUiState(
     val catalogLoading: Boolean = false,
     val download: ModelDownloadState = ModelDownloadState(),
     val apiKeyPresent: Boolean = false,
+    val groqApiKeyPresent: Boolean = false,
 )
 
 data class ContextHistoryEntry(val context: ListeningContext, val createdAtMillis: Long)
@@ -117,6 +116,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
     private val catalog = MutableStateFlow<List<OpenRouterModel>>(emptyList())
     private val catalogLoading = MutableStateFlow(false)
     private val download = MutableStateFlow(ModelDownloadState())
+    private val credentialRevision = MutableStateFlow(0)
     private var summaryJob: Job? = null
     private var lastSentTranscript = ""
     private val summaryGate = SummaryRequestGate()
@@ -129,7 +129,9 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         app.models.installedModels(),
         ::LocalState,
     )
-    private val remoteProgress = combine(catalogLoading, download, ::Pair)
+    private val remoteProgress = combine(catalogLoading, download, credentialRevision) { loading, modelDownload, _ ->
+        loading to modelDownload
+    }
     private val remoteContext = combine(streamingContext, summaryDiagnostics, ::Pair)
     private val remote = combine(
         remoteContext,
@@ -153,8 +155,16 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             catalogLoading = remoteState.loading,
             download = remoteState.download,
             apiKeyPresent = app.keyStore.read() != null,
+            groqApiKeyPresent = app.keyStore.readGroq() != null,
         )
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), ListenerUiState(apiKeyPresent = app.keyStore.read() != null))
+    }.stateIn(
+        viewModelScope,
+        SharingStarted.WhileSubscribed(5_000),
+        ListenerUiState(
+            apiKeyPresent = app.keyStore.read() != null,
+            groqApiKeyPresent = app.keyStore.readGroq() != null,
+        ),
+    )
 
     init {
         DownloadableModels.forEach { model ->
@@ -188,7 +198,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                         label = "summary_scheduler_started",
                         fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
                             "firstSummaryDelayMs" to FIRST_SUMMARY_DELAY_MS.toString(),
-                            "apiKeyPresent" to (app.keyStore.read() != null).yesNo(),
+                            "apiKeyPresent" to remoteApiKeyPresent(preferences.selectedModel).yesNo(),
                         ),
                     )
                     delay(FIRST_SUMMARY_DELAY_MS)
@@ -220,14 +230,14 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         val preferences = uiState.value.preferences
         summaryDebugTrace.startNewRecording(
             preferences = preferences,
-            apiKeyPresent = app.keyStore.read() != null,
+            apiKeyPresent = remoteApiKeyPresent(preferences.selectedModel),
             runtime = ListeningRuntime.state.value,
         )
         summaryDebugTrace.append(
             sessionId = ListeningRuntime.state.value.sessionId,
             label = "start_recording_requested",
             fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
-                "apiKeyPresent" to (app.keyStore.read() != null).yesNo(),
+                "apiKeyPresent" to remoteApiKeyPresent(preferences.selectedModel).yesNo(),
                 "installedLocalModels" to uiState.value.installedModels.joinToString(",") { it.modelId }.ifBlank { "none" },
             ),
         )
@@ -300,7 +310,12 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         context.startService(Intent(context, service).setAction(action))
     }
 
-    fun setCadenceMillis(millis: Int) { viewModelScope.launch { app.preferences.setCadenceMillis(millis) } }
+    fun setCadenceMillis(millis: Int) {
+        viewModelScope.launch {
+            val minimum = minimumSummaryCadenceMillis(app.preferences.values.first().selectedModel)
+            app.preferences.setCadenceMillis(millis.coerceAtLeast(minimum))
+        }
+    }
     fun setTranscriptionEngine(engine: TranscriptionEngine) {
         if (ListeningRuntime.state.value.recording) return
         viewModelScope.launch { app.preferences.setTranscriptionEngine(engine) }
@@ -319,6 +334,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     fun saveApiKey(key: String) {
         app.keyStore.save(key)
+        credentialRevision.update(Int::inc)
         remoteStatus.value = RemoteStatus.Ready
         remoteMessage.value = null
         viewModelScope.launch { app.preferences.setRemoteEnabled(true) }
@@ -326,9 +342,10 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     fun clearApiKey() {
         app.keyStore.clear()
+        credentialRevision.update(Int::inc)
         catalog.value = listOf(openRouterFreeRouterModel())
         remoteMessage.value = null
-        viewModelScope.launch { app.preferences.setRemoteEnabled(false) }
+        if (app.keyStore.readGroq() == null) viewModelScope.launch { app.preferences.setRemoteEnabled(false) }
     }
 
     fun refreshCatalog() {
@@ -340,7 +357,12 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                     val models = result.value.withOpenRouterFreeRouter()
                     catalog.value = models
                     val selected = app.preferences.values.first().selectedModel
-                    if (selected != null && selected != DEFAULT_OPENROUTER_MODEL_ID && models.none { it.id == selected }) app.preferences.clearSelectedModel()
+                    if (
+                        selected != null &&
+                        selected != DEFAULT_OPENROUTER_MODEL_ID &&
+                        selected != GROQ_GPT_OSS_20B_REMOTE_MODEL_ID &&
+                        models.none { it.id == selected }
+                    ) app.preferences.clearSelectedModel()
                     remoteStatus.value = RemoteStatus.Ready
                     remoteMessage.value = if (result.value.isEmpty()) "Using OpenRouter free router for English context." else null
                 }
@@ -350,7 +372,12 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    fun selectRemoteModel(id: String) { viewModelScope.launch { app.preferences.setSelectedModel(id) } }
+    fun selectRemoteModel(id: String) {
+        viewModelScope.launch {
+            val minimum = minimumSummaryCadenceMillis(id)
+            app.preferences.setSelectedModel(id, minimum)
+        }
+    }
 
     fun selectLocalModel(id: String) {
         if (ListeningRuntime.state.value.recording || app.models.installed(id) == null) return
@@ -392,12 +419,6 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     suspend fun exportSession(id: Long): String = app.sessions.export(id)
 
-    suspend fun saveSessionSummaryTraceToDownloads(id: Long): String = withContext(Dispatchers.IO) {
-        val fileName = "listener-summary-trace-$id-${System.currentTimeMillis()}.txt"
-        val text = detailedSummaryTraceText(id)
-        saveTextToDownloads(app, fileName, text)
-    }
-
     suspend fun createSessionSummaryTraceShareIntent(id: Long): Intent = withContext(Dispatchers.IO) {
         val fileName = "listener-summary-trace-$id-${System.currentTimeMillis()}.txt"
         val file = writeTextToTraceShareCache(app, fileName, detailedSummaryTraceText(id))
@@ -412,6 +433,14 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             diagnostics = summaryDiagnostics.value,
             sessionId = id,
         )
+
+    private fun remoteApiKey(modelId: String?): String? =
+        if (modelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) app.keyStore.readGroq() else app.keyStore.read()
+
+    private fun remoteApiKeyPresent(modelId: String?): Boolean = remoteApiKey(modelId) != null
+
+    private fun remoteProviderName(modelId: String): String =
+        if (modelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "Groq" else "OpenRouter"
 
     private suspend fun sendSummaryIfNeeded(preferences: ListenerPreferences) {
         val runtime = ListeningRuntime.state.value
@@ -433,7 +462,8 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun sendSummaryIfNeededLocked(preferences: ListenerPreferences) {
         val runtime = ListeningRuntime.state.value
-        val apiKeyPresent = app.keyStore.read() != null
+        val requestedModel = preferences.selectedModel
+        val apiKeyPresent = remoteApiKeyPresent(requestedModel)
         summaryDebugTrace.append(
             sessionId = runtime.sessionId,
             label = "summary_attempt_started",
@@ -454,27 +484,32 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             )
             return
         }
-        val key = app.keyStore.read() ?: run {
-            summaryDiagnostics.updateTrace("Waiting for OpenRouter key", preferences.summaryCadenceMillis)
+        val resolvedModel = requestedModel ?: run {
+            summaryDiagnostics.updateTrace("Waiting for selected remote model", preferences.summaryCadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
-                fields = summaryTraceFields(preferences, runtime) + mapOf("reason" to "missing_openrouter_key"),
+                fields = summaryTraceFields(preferences, runtime) + mapOf("reason" to "missing_remote_model"),
             )
             return
         }
-        val requestedModel = preferences.selectedModel ?: run {
-            summaryDiagnostics.updateTrace("Waiting for selected OpenRouter model", preferences.summaryCadenceMillis)
+        val selectedProviderKey = remoteApiKey(resolvedModel)
+        if (selectedProviderKey == null) {
+            val provider = remoteProviderName(resolvedModel)
+            summaryDiagnostics.updateTrace("Waiting for $provider key", preferences.summaryCadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
-                fields = summaryTraceFields(preferences, runtime) + mapOf("reason" to "missing_openrouter_model"),
+                fields = summaryTraceFields(preferences, runtime) + mapOf(
+                    "reason" to if (resolvedModel == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "missing_groq_key" else "missing_openrouter_key",
+                ),
             )
             return
         }
+        val fallbackOpenRouterKey = app.keyStore.read()
         val transcript = runtime.finalizedTranscriptForSummary()
         if (transcript.isBlank()) {
-            summaryDiagnostics.updateTrace("Waiting for finalized transcript", preferences.summaryCadenceMillis, requestedModel, transcriptChars = 0, deltaChars = 0)
+            summaryDiagnostics.updateTrace("Waiting for finalized transcript", preferences.summaryCadenceMillis, resolvedModel, transcriptChars = 0, deltaChars = 0)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -483,7 +518,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             return
         }
         if (transcript == lastSentTranscript) {
-            summaryDiagnostics.updateTrace("No new finalized transcript", preferences.summaryCadenceMillis, requestedModel, transcriptChars = transcript.length, deltaChars = 0)
+            summaryDiagnostics.updateTrace("No new finalized transcript", preferences.summaryCadenceMillis, resolvedModel, transcriptChars = transcript.length, deltaChars = 0)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -500,7 +535,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             sessionId = runtime.sessionId,
             label = "summary_prompt_prepared",
             fields = summaryTraceFields(preferences, runtime) + mapOf(
-                "requestedModel" to requestedModel,
+                "requestedModel" to resolvedModel,
                 "fullDeltaChars" to newText.length.toString(),
                 "sentNewChineseDeltaChars" to promptInputs.newChineseDelta.length.toString(),
                 "sentChineseContinuityTailChars" to promptInputs.chineseContinuityTail.length.toString(),
@@ -512,7 +547,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         val transcriptReadyAt = System.currentTimeMillis()
         summaryDiagnostics.value = SummaryDiagnostics(
             phase = "Transcript ready",
-            modelId = requestedModel,
+            modelId = resolvedModel,
             cadenceMillis = preferences.summaryCadenceMillis,
             transcriptChars = transcript.length,
             deltaChars = newText.length,
@@ -521,11 +556,13 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         )
         Log.d(SUMMARY_LOG_TAG, "transcript_ready=$transcriptReadyAt chars=${transcript.length} delta=${newText.length}")
         var firstTokenLogged = false
-        streamingContext.update { it.copy(draft = null, isStreaming = true) }
+        streamingContext.update {
+            it.copy(draft = null, isStreaming = resolvedModel != GROQ_GPT_OSS_20B_REMOTE_MODEL_ID)
+        }
         val requestStartAt = System.currentTimeMillis()
         summaryDiagnostics.update { current ->
             current.copy(
-                phase = "OpenRouter request started",
+                phase = "${remoteProviderName(resolvedModel)} request started",
                 requestStartedAtMillis = requestStartAt,
                 error = null,
                 events = current.events.plus(SummaryTraceEvent(requestStartAt, "Request started: ${requestStartAt - transcriptReadyAt}ms after trigger")).takeLast(MAX_SUMMARY_EVENTS),
@@ -534,17 +571,31 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         Log.d(SUMMARY_LOG_TAG, "request_start=$requestStartAt after_transcript_ready_ms=${requestStartAt - transcriptReadyAt}")
         summaryDebugTrace.append(
             sessionId = runtime.sessionId,
-            label = "openrouter_request_started",
+            label = if (resolvedModel == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "groq_request_started" else "openrouter_request_started",
             fields = summaryTraceFields(preferences, runtime) + mapOf(
-                "requestedModel" to requestedModel,
-                "effectiveModel" to requestedModel,
+                "requestedModel" to resolvedModel,
+                "effectiveModel" to resolvedModel,
+                "remoteProvider" to remoteProviderName(resolvedModel),
                 "fallbackAttempted" to false.yesNo(),
                 "requestDelayAfterTranscriptReadyMs" to (requestStartAt - transcriptReadyAt).toString(),
             ),
         )
-        var activeRemoteModel = requestedModel
-        suspend fun requestSummary(model: String): RemoteResult<ListeningContext> =
-            app.openRouter.summarize(key, model, promptInputs.previousEnglishSummary, promptInputs.chineseContinuityTail, promptInputs.newChineseDelta) { draft ->
+        var activeRemoteModel = resolvedModel
+        suspend fun requestSummary(model: String): RemoteResult<ListeningContext> {
+            if (model == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+                return app.groq.summarize(
+                    apiKey = selectedProviderKey,
+                    priorEnglishContext = promptInputs.previousEnglishSummary,
+                    continuityChineseTail = promptInputs.chineseContinuityTail,
+                    newChineseText = promptInputs.newChineseDelta,
+                )
+            }
+            val openRouterKey = if (resolvedModel == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+                checkNotNull(fallbackOpenRouterKey)
+            } else {
+                selectedProviderKey
+            }
+            return app.openRouter.summarize(openRouterKey, model, promptInputs.previousEnglishSummary, promptInputs.chineseContinuityTail, promptInputs.newChineseDelta) { draft ->
                 val now = System.currentTimeMillis()
                 if (!firstTokenLogged) {
                     firstTokenLogged = true
@@ -552,7 +603,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                         sessionId = runtime.sessionId,
                         label = "openrouter_first_streaming_draft",
                         fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
-                            "requestedModel" to requestedModel,
+                            "requestedModel" to resolvedModel,
                             "effectiveModel" to activeRemoteModel,
                             "msAfterRequestStart" to (now - requestStartAt).toString(),
                             "draftGlobalContextChars" to draft.globalContext.length.toString(),
@@ -570,8 +621,13 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 }
                 streamingContext.update { it.copy(draft = draft, isStreaming = true, lastUpdatedAtMillis = now) }
             }
-        val firstResult = requestSummary(requestedModel)
-        val remoteAttempt = if (firstResult is RemoteResult.Failure && shouldRetrySummaryWithFreeRouter(requestedModel, firstResult)) {
+        }
+        val firstResult = requestSummary(resolvedModel)
+        val remoteAttempt = if (
+            firstResult is RemoteResult.Failure &&
+            shouldRetrySummaryWithFreeRouter(resolvedModel, firstResult) &&
+            fallbackOpenRouterKey != null
+        ) {
             val fallbackStartAt = System.currentTimeMillis()
             summaryDiagnostics.update { current ->
                 current.copy(
@@ -585,7 +641,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 sessionId = runtime.sessionId,
                 label = "openrouter_fallback_retry_started",
                 fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
-                    "requestedModel" to requestedModel,
+                    "requestedModel" to resolvedModel,
                     "effectiveModel" to OPENROUTER_FREE_ROUTER_MODEL_ID,
                     "fallbackAttempted" to true.yesNo(),
                     "firstFailureStatus" to firstResult.status.toString(),
@@ -604,7 +660,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         } else {
             SummaryRemoteAttempt(
                 result = firstResult,
-                effectiveModel = requestedModel,
+                effectiveModel = resolvedModel,
                 fallbackAttempted = false,
                 fallbackResult = "not_attempted",
             )
@@ -642,7 +698,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                     sessionId = runtime.sessionId,
                     label = if (commit.changed) "summary_response_committed" else "summary_response_valid_unchanged",
                     fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
-                        "requestedModel" to requestedModel,
+                        "requestedModel" to resolvedModel,
                         "effectiveModel" to remoteAttempt.effectiveModel,
                         "fallbackAttempted" to remoteAttempt.fallbackAttempted.yesNo(),
                         "fallbackResult" to remoteAttempt.fallbackResult,
@@ -674,7 +730,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                     label = "summary_response_failed",
                     fields = summaryTraceFields(preferences, ListeningRuntime.state.value) +
                         mapOf(
-                            "requestedModel" to requestedModel,
+                            "requestedModel" to resolvedModel,
                             "effectiveModel" to remoteAttempt.effectiveModel,
                             "fallbackAttempted" to remoteAttempt.fallbackAttempted.yesNo(),
                             "fallbackResult" to remoteAttempt.fallbackResult,
@@ -779,8 +835,35 @@ internal fun shouldRetrySummaryWithFreeRouter(model: String, failure: RemoteResu
 internal fun List<OpenRouterModel>.withOpenRouterFreeRouter(): List<OpenRouterModel> =
     if (any { it.id == OPENROUTER_FREE_ROUTER_MODEL_ID }) this else listOf(openRouterFreeRouterModel()) + this
 
+internal fun topRemoteModelOptions(
+    catalog: List<OpenRouterModel>,
+    selectedModel: String?,
+    groqAvailable: Boolean = false,
+): List<OpenRouterModel> {
+    val freeRouter = catalog.firstOrNull { it.id == OPENROUTER_FREE_ROUTER_MODEL_ID }
+        ?: openRouterFreeRouterModel()
+    val fastestCompatible = catalog
+        .filterNot { it.id == OPENROUTER_FREE_ROUTER_MODEL_ID }
+        .take(MAX_LOW_LATENCY_REMOTE_MODELS)
+    val selected = selectedModel
+        ?.takeUnless { it == OPENROUTER_FREE_ROUTER_MODEL_ID || it == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID }
+        ?.let { selectedId ->
+            catalog.firstOrNull { it.id == selectedId }
+                ?: OpenRouterModel(selectedId, selectedId)
+        }
+    return buildList {
+        add(freeRouter)
+        if (groqAvailable || selectedModel == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) add(groqGptOss20bModel())
+        addAll(fastestCompatible)
+        if (selected != null && none { it.id == selected.id }) add(selected)
+    }
+}
+
 internal fun openRouterFreeRouterModel(): OpenRouterModel =
     OpenRouterModel(OPENROUTER_FREE_ROUTER_MODEL_ID, "OpenRouter free router")
+
+internal fun groqGptOss20bModel(): OpenRouterModel =
+    OpenRouterModel(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID, "Groq · GPT-OSS 20B")
 
 private fun RemoteResult<ListeningContext>.summaryTraceResult(): String = when (this) {
     is RemoteResult.Success -> "success"
@@ -893,8 +976,8 @@ internal fun buildDetailedSummaryTrace(
     appendLine()
     appendLine("How to read this")
     appendLine("- If the Chinese transcript is good but English is missing, look for summary_attempt_skipped or summary_response_failed lines.")
-    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_openrouter_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent.")
-    appendLine("- InvalidResponse means OpenRouter replied, but the app could not parse valid JSON, so the previous context was kept and lastSentTranscript was not advanced.")
+    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_groq_key, missing_remote_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent.")
+    appendLine("- InvalidResponse means the selected remote provider replied, but the app could not parse valid JSON, so the previous context was kept and lastSentTranscript was not advanced.")
     appendLine("- RateLimited, Offline, TimedOut, InvalidKey, and ModelUnavailable are remote/API states; transcript capture can still be perfect while summaries fail.")
     appendLine()
     appendLine("Current diagnostics snapshot")
@@ -974,6 +1057,7 @@ private const val MAX_SUMMARY_EVENTS = 6
 private const val PREVIOUS_SUMMARY_PROMPT_CHARS = 2_000
 private const val CHINESE_DELTA_PROMPT_CHARS = 2_000
 private const val CHINESE_CONTINUITY_TAIL_CHARS = 800
+private const val MAX_LOW_LATENCY_REMOTE_MODELS = 5
 private const val SUMMARY_LOG_TAG = "ListenerSummary"
 
 private fun Boolean.yesNo(): String = if (this) "yes" else "no"
@@ -985,29 +1069,6 @@ private fun String.safeTraceValue(): String =
 
 private fun formatTraceTimestamp(timeMillis: Long): String =
     SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS Z", Locale.US).format(Date(timeMillis))
-
-private fun saveTextToDownloads(context: Context, fileName: String, text: String): String {
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        val resolver = context.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "text/plain")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-            put(MediaStore.MediaColumns.IS_PENDING, 1)
-        }
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: error("Unable to create Downloads file.")
-        resolver.openOutputStream(uri)?.bufferedWriter()?.use { it.write(text) }
-            ?: error("Unable to write Downloads file.")
-        resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
-        return fileName
-    }
-    val directory = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-    if (!directory.exists() && !directory.mkdirs()) error("Unable to create Downloads directory.")
-    val file = File(directory, fileName)
-    file.writeText(text)
-    return file.absolutePath
-}
 
 private fun writeTextToTraceShareCache(context: Context, fileName: String, text: String): File {
     val directory = File(context.cacheDir, "summary-trace-shares")
