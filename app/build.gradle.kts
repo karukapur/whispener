@@ -81,6 +81,7 @@ dependencies {
     implementation(libs.androidx.datastore.preferences)
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.compose.ui)
+    implementation(libs.compose.ui.tooling.preview)
     implementation(libs.compose.material3)
     implementation(libs.room.runtime)
     implementation(libs.room.ktx)

@@ -2,9 +2,13 @@ package com.listener.app
 
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.size
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.unit.dp
 import com.listener.app.context.ListeningContext
 import com.listener.app.context.OpenRouterModel
 import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
@@ -31,6 +35,81 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("English context").assertExists()
         compose.onNodeWithText("English context will appear after remote summaries are enabled.").assertDoesNotExist()
         compose.onNodeWithText("Summary trace").assertDoesNotExist()
+    }
+
+    @Test fun emptyListenStateExplainsBothPanels() {
+        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
+
+        compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
+        compose.onNodeWithText("English context will appear here once finalized Chinese speech is summarized.").assertExists()
+        compose.onNodeWithTag("transcript-empty").assertExists()
+        compose.onNodeWithText("Chinese speech will appear here while listening.").assertExists()
+    }
+
+    @Test fun loadingStateKeepsCommittedContextVisibleAndOffersCancel() {
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 2_000,
+                onIntervalChange = {},
+                onToggle = {},
+                contextState = StreamingContextState(
+                    current = ListeningContext("Committed topic", listOf("Committed detail")),
+                    history = listOf(ContextHistoryEntry(ListeningContext("Committed topic", listOf("Committed detail")), 1L)),
+                    draft = ListeningContext("Draft topic", listOf("Draft detail")),
+                    isStreaming = true,
+                ),
+                modelLoading = true,
+                activeModelId = "paraformer",
+            )
+        }
+
+        compose.onNodeWithText("Committed detail").assertExists()
+        compose.onNodeWithContentDescription("Loading English context").assertExists()
+        compose.onNodeWithTag("model-loading-indicator", useUnmergedTree = true).assertExists()
+        compose.onNodeWithText("Cancel").assertExists()
+    }
+
+    @Test fun localErrorsStayInRecordingControls() {
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 5_000,
+                onIntervalChange = {},
+                onToggle = {},
+                statusMessage = "Microphone permission is required to transcribe speech.",
+                statusIsError = true,
+            )
+        }
+
+        compose.onNodeWithTag("local-status").assertExists()
+        compose.onNodeWithTag("english-context-status").assertDoesNotExist()
+    }
+
+    @Test fun listenPanelsRemainSideBySideInWideLandscape() {
+        setTestContent {
+            Box(Modifier.size(width = 800.dp, height = 480.dp)) {
+                ListeningScreen(false, 0, 5_000, {}, {})
+            }
+        }
+
+        val context = compose.onNodeWithTag("context-card").getUnclippedBoundsInRoot()
+        val transcript = compose.onNodeWithTag("transcript").getUnclippedBoundsInRoot()
+        assertTrue(context.right <= transcript.left)
+    }
+
+    @Test fun listenPanelsRemainStackedInNarrowPortrait() {
+        setTestContent {
+            Box(Modifier.size(width = 360.dp, height = 720.dp)) {
+                ListeningScreen(false, 0, 5_000, {}, {})
+            }
+        }
+
+        val context = compose.onNodeWithTag("context-card").getUnclippedBoundsInRoot()
+        val transcript = compose.onNodeWithTag("transcript").getUnclippedBoundsInRoot()
+        assertTrue(context.bottom <= transcript.top)
     }
     @Test fun activeRecordingIsAnnounced() {
         setTestContent { ListeningScreen(true, 65, 10_000, {}, {}) }

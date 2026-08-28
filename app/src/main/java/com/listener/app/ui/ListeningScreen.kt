@@ -5,12 +5,12 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.Intent
+import android.content.res.Configuration
 import android.content.pm.PackageManager
 import android.os.Build
 import android.view.WindowManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.layout.*
@@ -19,19 +19,16 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
-import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateFloatAsState
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.LinearEasing
-import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -40,6 +37,8 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
@@ -61,13 +60,11 @@ import com.listener.app.data.minimumSummaryCadenceMillis
 import com.listener.app.data.snapSummaryCadenceMillis
 import com.listener.app.data.session.SessionEntity
 import com.listener.app.speech.InferenceBackend
+import com.listener.app.ui.theme.ListenerMotion
+import com.listener.app.ui.theme.ListenerSpacing
+import com.listener.app.ui.theme.ListenerTheme
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-
-private val ListenerBlue = Color(0xFF315F8C)
-private val ListenerNavy = Color(0xFF102A43)
-private val ListenerPaper = Color(0xFFF7F9FC)
-private val ListenerError = Color(0xFFBA1A1A)
 
 private enum class Destination(val route: String, val label: String, val marker: String) {
     Listen("listen", "Listen", "●"), Sessions("sessions", "Sessions", "≡"), Models("models", "Models", "↓"), Settings("settings", "Settings", "⚙")
@@ -81,20 +78,21 @@ private enum class Destination(val route: String, val label: String, val marker:
         if (grants[Manifest.permission.RECORD_AUDIO] == true) viewModel.startRecording(context)
         else com.listener.app.audio.ListeningRuntime.update { it.copy(recoverableError = "Microphone permission is required to transcribe speech.") }
     }
-    val colors = lightColorScheme(primary = ListenerBlue, background = ListenerPaper, surface = Color.White, onSurface = ListenerNavy, error = ListenerError)
-    MaterialTheme(colorScheme = colors) {
+    ListenerTheme {
         Surface(Modifier.fillMaxSize()) {
-            if (!state.preferences.onboardingComplete) {
-                PrivacyOnboarding { remote, retention -> viewModel.completeOnboarding(remote, retention) }
-            } else {
-                ListenerNavigation(state, viewModel) {
-                    if (state.runtime.recording) viewModel.stopRecording(context) else {
-                        val required = buildList {
-                            add(Manifest.permission.RECORD_AUDIO)
-                            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-                        }.toTypedArray()
-                        val missing = required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
-                        if (missing) permissionLauncher.launch(required) else viewModel.startRecording(context)
+            Box(Modifier.fillMaxSize().safeDrawingPadding()) {
+                if (!state.preferences.onboardingComplete) {
+                    PrivacyOnboarding { remote, retention -> viewModel.completeOnboarding(remote, retention) }
+                } else {
+                    ListenerNavigation(state, viewModel) {
+                        if (state.runtime.recording) viewModel.stopRecording(context) else {
+                            val required = buildList {
+                                add(Manifest.permission.RECORD_AUDIO)
+                                if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+                            }.toTypedArray()
+                            val missing = required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
+                            if (missing) permissionLauncher.launch(required) else viewModel.startRecording(context)
+                        }
                     }
                 }
             }
@@ -237,7 +235,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     minimumIntervalMillis: Int = MIN_SUMMARY_CADENCE_MILLIS,
 ) {
     val resolvedContextState = contextState ?: legacyContextState(globalContext, details)
-    BoxWithConstraints(Modifier.fillMaxSize().padding(16.dp).testTag("adaptive-root")) {
+    BoxWithConstraints(Modifier.fillMaxSize().padding(ListenerSpacing.Large).testTag("adaptive-root")) {
         val wide = maxWidth >= 600.dp && maxWidth > maxHeight
         val density = LocalDensity.current
         var contextRatio by rememberSaveable { mutableFloatStateOf(0.75f) }
@@ -263,10 +261,22 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                 )
                 TranscriptCard(stableTranscript, provisionalTranscript, Modifier.weight(1f - contextRatio).fillMaxWidth())
             }
-            if (statusMessage != null) {
-                Text(statusMessage, color = if (statusIsError) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 8.dp))
-            }
-            Controls(recording, recordingAvailable, modelLoading, stopping, elapsedSeconds, intervalMillis, minimumIntervalMillis, audioLevel, activeModelId, backend, onIntervalChange, onToggle)
+            Controls(
+                recording = recording,
+                recordingAvailable = recordingAvailable,
+                modelLoading = modelLoading,
+                stopping = stopping,
+                elapsed = elapsedSeconds,
+                intervalMillis = intervalMillis,
+                minimumIntervalMillis = minimumIntervalMillis,
+                audioLevel = audioLevel,
+                activeModelId = activeModelId,
+                backend = backend,
+                statusMessage = statusMessage,
+                statusIsError = statusIsError,
+                change = onIntervalChange,
+                toggle = onToggle,
+            )
         }
     }
 }
@@ -308,8 +318,7 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
     val current = contextState.current
     val draft = contextState.draft
     val heading = current?.globalContext
-        ?: draft?.globalContext?.takeIf(String::isNotBlank)
-        ?: emptyMessage
+        ?: draft?.globalContext?.takeIf(String::isNotBlank).orEmpty()
     LaunchedEffect(scroll.value, scroll.maxValue, scroll.isScrollInProgress) {
         if (scroll.value >= scroll.maxValue - 48) followUpdates = true
         else if (scroll.isScrollInProgress) followUpdates = false
@@ -320,28 +329,43 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
             scroll.animateScrollTo(scroll.maxValue)
         }
     }
-    OutlinedCard(modifier, border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-        Column(Modifier.fillMaxSize().padding(16.dp).testTag("context-card")) {
+    Card(
+        modifier = modifier,
+        shape = MaterialTheme.shapes.extraLarge,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.primaryContainer,
+            contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+        ),
+    ) {
+        Column(Modifier.fillMaxSize().padding(ListenerSpacing.Large).testTag("context-card")) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-                Text("English context", style = MaterialTheme.typography.titleMedium)
+                Text("English context", style = MaterialTheme.typography.titleLarge)
                 if (contextState.isStreaming) {
                     StreamingIndicator()
                 }
             }
-            Spacer(Modifier.height(8.dp))
+            Spacer(Modifier.height(ListenerSpacing.Small))
             if (heading.isNotBlank()) Text(heading, style = MaterialTheme.typography.bodyLarge, modifier = Modifier.testTag("context-heading"))
             englishContextStatus(diagnostics, contextState.isStreaming, remoteStatus, remoteMessage)?.let { status ->
-                Text(
-                    status,
-                    color = if (remoteStatus == RemoteStatus.Ready) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.padding(top = 4.dp).testTag("english-context-status"),
-                )
+                val isError = remoteStatus != RemoteStatus.Ready
+                Surface(
+                    color = if (isError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = if (isError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.padding(top = ListenerSpacing.Small).fillMaxWidth().testTag("english-context-status"),
+                ) {
+                    Text(status, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.Small))
+                }
             }
-            HorizontalDivider(Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            HorizontalDivider(Modifier.padding(vertical = ListenerSpacing.Medium), color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.22f))
             Column(Modifier.weight(1f).verticalScroll(scroll).testTag("context-history")) {
                 if (contextState.history.isEmpty() && draft == null) {
-                    if (emptyMessage.isNotBlank()) Text(emptyMessage, color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyLarge)
+                    Text(
+                        emptyMessage.ifBlank { "English context will appear here once finalized Chinese speech is summarized." },
+                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.76f),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.testTag("english-context-empty"),
+                    )
                 } else {
                     contextState.history.forEach { entry -> ContextHistoryItem(entry.context) }
                     draft?.let { ContextDraftItem(it) }
@@ -377,15 +401,17 @@ private fun englishContextStatus(
 }
 
 @Composable private fun StreamingIndicator() {
-    val rotation by rememberInfiniteTransition(label = "summary fetch").animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(tween(durationMillis = 900, easing = LinearEasing)),
-        label = "summary fetch rotation",
-    )
-    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-        Text("↻", color = MaterialTheme.colorScheme.primary, modifier = Modifier.graphicsLayer { rotationZ = rotation }, style = MaterialTheme.typography.labelLarge)
-        Text("Fetching", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
+    Row(
+        modifier = Modifier.semantics { contentDescription = "Loading English context" },
+        horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
+        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier.size(18.dp),
+            strokeWidth = 2.dp,
+            color = MaterialTheme.colorScheme.onPrimaryContainer,
+        )
+        Text("Updating", color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelMedium)
     }
 }
 
@@ -432,8 +458,10 @@ private fun englishContextStatus(
 @Composable private fun ContextDraftItem(context: ListeningContext) {
     Column(Modifier.fillMaxWidth().padding(bottom = 4.dp).semantics { contentDescription = "Streaming English context update" }) {
         val heading = context.globalContext.ifBlank { "Updating…" }
-        Text(heading, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelLarge)
-        context.details.forEach { Text("• $it", Modifier.padding(top = 6.dp), color = MaterialTheme.colorScheme.onSurfaceVariant) }
+        Text(heading, color = MaterialTheme.colorScheme.onPrimaryContainer, style = MaterialTheme.typography.labelLarge)
+        context.details.forEach {
+            Text("• $it", Modifier.padding(top = 6.dp), color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.76f))
+        }
     }
 }
 
@@ -465,10 +493,14 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
             scroll.animateScrollTo(scroll.maxValue)
         }
     }
-    OutlinedCard(modifier.testTag("transcript"), border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)) {
-        Column(Modifier.padding(16.dp)) {
+    Card(
+        modifier = modifier.testTag("transcript"),
+        shape = MaterialTheme.shapes.large,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+    ) {
+        Column(Modifier.padding(ListenerSpacing.Large)) {
             Text("Traditional Chinese transcript", style = MaterialTheme.typography.titleMedium)
-            Column(Modifier.padding(top = 8.dp).weight(1f).verticalScroll(scroll)) {
+            Column(Modifier.padding(top = ListenerSpacing.Small).weight(1f).verticalScroll(scroll)) {
                 if (stableText.isNotBlank() || provisionalText.isNotBlank()) {
                     Text(stableText, style = MaterialTheme.typography.bodyLarge)
                     AnimatedVisibility(visible = provisionalText.isNotBlank(), enter = fadeIn(), exit = fadeOut()) {
@@ -479,13 +511,19 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
                             modifier = Modifier.semantics { contentDescription = "Provisional transcript: $provisionalText" },
                         )
                     }
+                } else {
+                    Text(
+                        "Chinese speech will appear here while listening.",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.testTag("transcript-empty"),
+                    )
                 }
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable private fun Controls(
     recording: Boolean,
     recordingAvailable: Boolean,
@@ -497,33 +535,122 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     audioLevel: Float,
     activeModelId: String?,
     backend: InferenceBackend?,
+    statusMessage: String?,
+    statusIsError: Boolean,
     change: (Int) -> Unit,
     toggle: () -> Unit,
 ) {
-    val indicatorAlpha by animateFloatAsState(if (recording) 0.55f + audioLevel * 0.45f else 0f, label = "recording indicator")
-    Column(Modifier.fillMaxWidth().padding(top = 12.dp)) {
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            Box(Modifier.size(10.dp).graphicsLayer { alpha = indicatorAlpha }.background(MaterialTheme.colorScheme.error, MaterialTheme.shapes.extraLarge))
-            AnimatedContent(targetState = Triple(recording, modelLoading, stopping), label = "recording status") { state ->
-                val text = when {
-                    state.third -> "Finishing transcript…"
-                    state.second -> "Loading ${activeModelId.orEmpty()}…"
-                    state.first -> "Recording  %02d:%02d".format(elapsed / 60, elapsed % 60)
-                    else -> "Ready to listen"
+    val indicatorAlpha by animateFloatAsState(
+        targetValue = if (recording) 0.55f + audioLevel * 0.45f else 0.28f,
+        animationSpec = tween(ListenerMotion.FastDurationMillis),
+        label = "recording indicator",
+    )
+    val actionCorner by animateDpAsState(
+        targetValue = if (recording) 18.dp else 28.dp,
+        animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
+        label = "record action shape",
+    )
+    val actionColor by animateColorAsState(
+        targetValue = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
+        label = "record action color",
+    )
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.Medium).testTag("listening-controls"),
+        color = MaterialTheme.colorScheme.surfaceContainerLow,
+        shape = MaterialTheme.shapes.extraLarge,
+        tonalElevation = 3.dp,
+    ) {
+        Column(Modifier.fillMaxWidth().padding(ListenerSpacing.Large)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                Box(
+                    Modifier
+                        .size(10.dp)
+                        .graphicsLayer { alpha = indicatorAlpha }
+                        .background(if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.outline, MaterialTheme.shapes.extraLarge),
+                )
+                AnimatedContent(
+                    targetState = Triple(recording, modelLoading, stopping),
+                    modifier = Modifier.weight(1f),
+                    label = "recording status",
+                ) { state ->
+                    val text = when {
+                        state.third -> "Finishing transcript…"
+                        state.second -> "Loading ${activeModelId.orEmpty()}…"
+                        state.first -> "Recording  %02d:%02d".format(elapsed / 60, elapsed % 60)
+                        else -> "Ready to listen"
+                    }
+                    Text(
+                        text,
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.semantics { contentDescription = if (recording) "Recording active" else "Recording stopped" },
+                    )
                 }
-                Text(text, modifier = Modifier.semantics { contentDescription = if (recording) "Recording active" else "Recording stopped" })
-            }
-            if (recording && !modelLoading) AudioLevelMeter(audioLevel)
-            backend?.let {
-                Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = MaterialTheme.shapes.extraLarge) {
-                    Text(it.label, Modifier.padding(horizontal = 10.dp, vertical = 6.dp).semantics { contentDescription = "Inference backend ${it.label}" }, style = MaterialTheme.typography.labelMedium)
+                if (recording && !modelLoading) AudioLevelMeter(audioLevel)
+                backend?.let {
+                    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = MaterialTheme.shapes.extraLarge) {
+                        Text(
+                            it.label,
+                            Modifier
+                                .padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.Small)
+                                .semantics { contentDescription = "Inference backend ${it.label}" },
+                            style = MaterialTheme.typography.labelMedium,
+                        )
+                    }
                 }
             }
-        }
-        Row(Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            CadenceSlider(intervalMillis, minimumIntervalMillis, change, Modifier.weight(1f))
-            Button(enabled = !stopping && (recording || recordingAvailable), onClick = toggle, modifier = Modifier.heightIn(min = 48.dp).testTag("record-toggle"), colors = ButtonDefaults.buttonColors(containerColor = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary)) {
-                AnimatedContent(targetState = when { stopping -> "Finishing…"; modelLoading -> "Cancel"; recording -> "Stop"; recordingAvailable -> "Start"; else -> "Model required" }, label = "record action") { Text(it) }
+            statusMessage?.let { message ->
+                Surface(
+                    color = if (statusIsError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
+                    contentColor = if (statusIsError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
+                    shape = MaterialTheme.shapes.small,
+                    modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.Small).testTag("local-status"),
+                ) {
+                    Text(message, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(ListenerSpacing.Medium))
+                }
+            }
+            Row(
+                Modifier.fillMaxWidth().padding(top = ListenerSpacing.Small),
+                horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Medium),
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+            ) {
+                CadenceSlider(intervalMillis, minimumIntervalMillis, change, Modifier.weight(1f))
+                Button(
+                    enabled = !stopping && (recording || recordingAvailable),
+                    onClick = toggle,
+                    modifier = Modifier.heightIn(min = 56.dp).widthIn(min = 104.dp).testTag("record-toggle"),
+                    shape = RoundedCornerShape(actionCorner),
+                    colors = ButtonDefaults.buttonColors(containerColor = actionColor),
+                ) {
+                    val action = when {
+                        stopping -> "Finishing…"
+                        modelLoading -> "Cancel"
+                        recording -> "Stop"
+                        recordingAvailable -> "Start"
+                        else -> "Model required"
+                    }
+                    AnimatedContent(targetState = action, label = "record action") { label ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
+                            verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                        ) {
+                            if (modelLoading || stopping) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp).testTag("model-loading-indicator"),
+                                    color = LocalContentColor.current,
+                                    strokeWidth = 2.dp,
+                                )
+                            }
+                            Text(label)
+                        }
+                    }
+                }
             }
         }
     }
@@ -663,3 +790,122 @@ private fun Int.formatCadenceMillis(): String {
         }
     }
 }
+
+@Preview(name = "Listen · Light", showBackground = true, widthDp = 412, heightDp = 892)
+@Composable
+private fun ListeningLightPreview() {
+    ListeningPreviewFrame {
+        ListeningScreen(
+            recording = false,
+            elapsedSeconds = 0,
+            intervalMillis = 2_500,
+            onIntervalChange = {},
+            onToggle = {},
+            contextState = previewContextState(),
+            stableTranscript = "我們先確認明天早上九點在台北車站見面。",
+            provisionalTranscript = "然後一起去",
+            backend = InferenceBackend.VULKAN,
+        )
+    }
+}
+
+@Preview(
+    name = "Listen · Dark recording",
+    showBackground = true,
+    widthDp = 412,
+    heightDp = 892,
+    uiMode = Configuration.UI_MODE_NIGHT_YES,
+)
+@Composable
+private fun ListeningDarkPreview() {
+    ListeningPreviewFrame(darkTheme = true) {
+        ListeningScreen(
+            recording = true,
+            elapsedSeconds = 65,
+            intervalMillis = 5_000,
+            onIntervalChange = {},
+            onToggle = {},
+            contextState = previewContextState(),
+            stableTranscript = "我們先確認明天早上九點在台北車站見面。",
+            provisionalTranscript = "然後一起去吃早餐。",
+            audioLevel = 0.64f,
+            activeModelId = "sherpa-paraformer-zh-en",
+            backend = InferenceBackend.CPU,
+        )
+    }
+}
+
+@Preview(name = "Listen · Empty", showBackground = true, widthDp = 412, heightDp = 892)
+@Composable
+private fun ListeningEmptyPreview() {
+    ListeningPreviewFrame {
+        ListeningScreen(false, 0, 5_000, {}, {})
+    }
+}
+
+@Preview(name = "Listen · Loading", showBackground = true, widthDp = 412, heightDp = 892)
+@Composable
+private fun ListeningLoadingPreview() {
+    ListeningPreviewFrame {
+        ListeningScreen(
+            recording = false,
+            elapsedSeconds = 0,
+            intervalMillis = 2_000,
+            onIntervalChange = {},
+            onToggle = {},
+            contextState = previewContextState().copy(
+                draft = ListeningContext("Adding travel details", listOf("Checking the meeting point")),
+                isStreaming = true,
+            ),
+            stableTranscript = "明天早上九點在台北車站見面。",
+            modelLoading = true,
+            activeModelId = "paraformer",
+        )
+    }
+}
+
+@Preview(name = "Listen · Remote error", showBackground = true, widthDp = 412, heightDp = 892)
+@Composable
+private fun ListeningRemoteErrorPreview() {
+    ListeningPreviewFrame {
+        ListeningScreen(
+            recording = true,
+            elapsedSeconds = 18,
+            intervalMillis = 2_500,
+            onIntervalChange = {},
+            onToggle = {},
+            contextState = previewContextState(),
+            stableTranscript = "明天早上九點在台北車站見面。",
+            remoteStatus = RemoteStatus.ModelUnavailable,
+            remoteMessage = "No endpoints found. Local transcription is still active.",
+            audioLevel = 0.32f,
+            backend = InferenceBackend.CPU,
+        )
+    }
+}
+
+@Composable
+private fun ListeningPreviewFrame(
+    darkTheme: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    ListenerTheme(darkTheme = darkTheme, dynamicColor = false) {
+        Surface(Modifier.fillMaxSize()) { content() }
+    }
+}
+
+private fun previewContextState(): StreamingContextState = StreamingContextState(
+    current = ListeningContext(
+        globalContext = "Planning tomorrow's meetup",
+        details = listOf("Meet at Taipei Main Station at 9:00 AM", "Breakfast is the next likely stop"),
+    ),
+    history = listOf(
+        ContextHistoryEntry(
+            ListeningContext(
+                globalContext = "Planning tomorrow's meetup",
+                details = listOf("Meet at Taipei Main Station at 9:00 AM", "Breakfast is the next likely stop"),
+            ),
+            createdAtMillis = 0L,
+        ),
+    ),
+)

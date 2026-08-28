@@ -48,7 +48,7 @@ On first launch:
 
 ## Design system
 
-Listener uses Material 3 with semantic primary, surface, outline, and error colors; Roboto platform typography; a 4/8/12/16/24/32/48 dp spacing scale; 48 dp minimum touch targets; bottom navigation for four primary destinations; scrollable content for font scaling; and TalkBack labels for navigation and recording state. Wide landscape windows use two content panes, while portrait, cover-size, and split-screen windows stack them.
+Listener uses stable Material 3 with dynamic light and dark color on Android 12+, complete Listener-blue fallback palettes, shared typography/shape/spacing tokens, and purposeful state motion. It retains Roboto platform typography, 48 dp minimum touch targets, bottom navigation for four primary destinations, scrollable content for font scaling, and TalkBack labels for navigation and recording state. The Listen screen treats English context as the primary tonal surface while keeping the Traditional Chinese transcript visible; wide landscape windows use two resizable content panes, while portrait, cover-size, and split-screen windows stack them.
 
 ## Quality gates
 
