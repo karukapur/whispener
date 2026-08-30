@@ -23,12 +23,16 @@ import androidx.compose.material3.*
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.*
@@ -105,6 +109,10 @@ private enum class Destination(val route: String, val label: String, @DrawableRe
                 } else {
                     ListenerNavigation(state, viewModel) {
                         if (state.runtime.recording) viewModel.stopRecording(context) else {
+                            if (state.isMissingRequiredLocalModel()) {
+                                viewModel.startRecording(context)
+                                return@ListenerNavigation
+                            }
                             val required = buildList {
                                 add(Manifest.permission.RECORD_AUDIO)
                                 if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
@@ -133,6 +141,18 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     is Activity -> this
     is ContextWrapper -> baseContext.findActivity()
     else -> null
+}
+
+private fun ListenerUiState.isMissingRequiredLocalModel(): Boolean {
+    if (preferences.transcriptionEngine == TranscriptionEngine.ANDROID_ON_DEVICE) return false
+    val installedIds = installedModels.map { it.modelId }.toSet()
+    return when (preferences.transcriptionEngine) {
+        TranscriptionEngine.WHISPER_CPP -> installedIds.isEmpty()
+        TranscriptionEngine.SHERPA_ONNX ->
+            ModelManager.STREAMING_PARAFORMER_BILINGUAL_ID !in installedIds &&
+                ModelManager.SENSE_VOICE_ID !in installedIds
+        TranscriptionEngine.ANDROID_ON_DEVICE -> false
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -170,9 +190,16 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
         },
     ) { padding ->
         NavHost(navController, startDestination = Destination.Listen.route, Modifier.padding(padding)) {
-            composable(Destination.Listen.route) {
+            composable(
+                Destination.Listen.route,
+                enterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                exitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+                popEnterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                popExitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+            ) {
                 val setupMessage = when {
                     state.preferences.transcriptionEngine == TranscriptionEngine.WHISPER_CPP && state.installedModels.isEmpty() -> "A local Whisper model is required before recording. Open Models to view the Base download."
+                    state.isMissingRequiredLocalModel() -> "Install a local model from Models before listening."
                     else -> null
                 }
                 ListeningScreen(
@@ -189,7 +216,7 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     statusMessage = state.runtime.recoverableError ?: state.runtime.transcriptionStatus ?: setupMessage,
                     statusIsError = state.runtime.recoverableError != null,
                     remoteStatus = state.remoteStatus,
-                    recordingAvailable = state.preferences.transcriptionEngine != TranscriptionEngine.WHISPER_CPP || state.installedModels.isNotEmpty(),
+                    recordingAvailable = !state.isMissingRequiredLocalModel(),
                     modelLoading = state.runtime.modelLoading,
                     stopping = state.runtime.stopping,
                     audioLevel = state.runtime.audioLevel,
@@ -201,10 +228,22 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     minimumIntervalMillis = minimumSummaryCadenceMillis(state.preferences.selectedModel),
                 )
             }
-            composable(Destination.Sessions.route) {
+            composable(
+                Destination.Sessions.route,
+                enterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                exitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+                popEnterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                popExitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+            ) {
                 SessionsScreen(state.sessions, viewModel, state.summaryDiagnostics, state.streamingContext.isStreaming)
             }
-            composable(Destination.Models.route) {
+            composable(
+                Destination.Models.route,
+                enterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                exitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+                popEnterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                popExitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+            ) {
                 ModelManagementScreen(
                     activeId = state.runtime.activeModelId,
                     selectedId = state.preferences.selectedLocalModelId,
@@ -224,7 +263,13 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                     onWorkProfile = viewModel::setWhisperWorkProfile,
                 )
             }
-            composable(Destination.Settings.route) {
+            composable(
+                Destination.Settings.route,
+                enterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                exitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+                popEnterTransition = { tabEnterTransition(initialState.destination.route, targetState.destination.route) },
+                popExitTransition = { tabExitTransition(initialState.destination.route, targetState.destination.route) },
+            ) {
                 RemoteSettings(
                     apiKeyPresent = state.apiKeyPresent,
                     groqApiKeyPresent = state.groqApiKeyPresent,
@@ -247,6 +292,39 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
         }
     }
 }
+
+private fun tabEnterTransition(fromRoute: String?, toRoute: String?): EnterTransition {
+    val direction = tabDirection(fromRoute, toRoute)
+    return fadeIn(animationSpec = tween(TabFadeInMillis)) +
+        slideInHorizontally(
+            animationSpec = tween(TabSlideMillis, easing = ListenerMotion.EmphasisEasing),
+            initialOffsetX = { fullWidth -> direction * (fullWidth / TabSlideDistanceDivisor) },
+        )
+}
+
+private fun tabExitTransition(fromRoute: String?, toRoute: String?): ExitTransition {
+    val direction = tabDirection(fromRoute, toRoute)
+    return fadeOut(animationSpec = tween(TabFadeOutMillis)) +
+        slideOutHorizontally(
+            animationSpec = tween(TabSlideMillis, easing = ListenerMotion.EmphasisEasing),
+            targetOffsetX = { fullWidth -> -direction * (fullWidth / TabSlideDistanceDivisor) },
+        )
+}
+
+private fun tabDirection(fromRoute: String?, toRoute: String?): Int {
+    val from = Destination.entries.indexOfFirst { it.route == fromRoute }
+    val to = Destination.entries.indexOfFirst { it.route == toRoute }
+    return when {
+        from == -1 || to == -1 || from == to -> 0
+        to > from -> 1
+        else -> -1
+    }
+}
+
+private const val TabFadeInMillis = 150
+private const val TabFadeOutMillis = 90
+private const val TabSlideMillis = 180
+private const val TabSlideDistanceDivisor = 18
 
 @Composable fun ListeningScreen(
     recording: Boolean,
@@ -277,7 +355,12 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     minimumIntervalMillis: Int = MIN_SUMMARY_CADENCE_MILLIS,
 ) {
     val resolvedContextState = contextState ?: legacyContextState(globalContext, details)
-    BoxWithConstraints(Modifier.fillMaxSize().padding(24.dp).testTag("adaptive-root")) {
+    BoxWithConstraints(
+        Modifier
+            .fillMaxSize()
+            .padding(horizontal = 16.dp, vertical = 24.dp)
+            .testTag("adaptive-root"),
+    ) {
         val wide = maxWidth >= 600.dp && maxWidth > maxHeight
         val density = LocalDensity.current
         var contextRatio by rememberSaveable { mutableFloatStateOf(0.6f) }
@@ -325,19 +408,113 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
                 recordingAvailable = recordingAvailable,
                 modelLoading = modelLoading,
                 stopping = stopping,
-                elapsed = elapsedSeconds,
-                audioLevel = audioLevel,
-                activeModelId = activeModelId,
-                backend = backend,
-                statusMessage = statusMessage,
-                statusIsError = statusIsError,
-                downloadModelId = downloadModelId,
-                downloadProgress = downloadProgress,
-                onCancelDownload = onCancelDownload,
                 toggle = onToggle,
             )
         }
+        CompactListenStatusOverlay(
+            recording = recording,
+            modelLoading = modelLoading,
+            stopping = stopping,
+            elapsed = elapsedSeconds,
+            audioLevel = audioLevel,
+            activeModelId = activeModelId,
+            backend = backend,
+            modifier = Modifier.align(Alignment.TopEnd),
+        )
     }
+}
+
+@Composable private fun CompactListenStatusOverlay(
+    recording: Boolean,
+    modelLoading: Boolean,
+    stopping: Boolean,
+    elapsed: Long,
+    audioLevel: Float,
+    activeModelId: String?,
+    backend: InferenceBackend?,
+    modifier: Modifier = Modifier,
+) {
+    val showStatus = recording || modelLoading || stopping
+    val indicatorAlpha by animateFloatAsState(
+        targetValue = if (recording) 0.55f + audioLevel * 0.45f else 0.28f,
+        animationSpec = tween(ListenerMotion.FastDurationMillis),
+        label = "recording indicator",
+    )
+    AnimatedVisibility(visible = showStatus, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
+        Surface(
+            color = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.96f),
+            contentColor = MaterialTheme.colorScheme.onSurface,
+            shape = MaterialTheme.shapes.medium,
+            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.58f)),
+            modifier = Modifier.widthIn(max = 180.dp).testTag("listen-header-status"),
+        ) {
+            Column(
+                Modifier.padding(horizontal = ListenerSpacing.Small, vertical = 6.dp),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                CompactRecordingRow(
+                    recording = recording,
+                    modelLoading = modelLoading,
+                    stopping = stopping,
+                    elapsed = elapsed,
+                    audioLevel = audioLevel,
+                    activeModelId = activeModelId,
+                    backend = backend,
+                    indicatorAlpha = indicatorAlpha,
+                )
+            }
+        }
+    }
+}
+
+@Composable private fun CompactRecordingRow(
+    recording: Boolean,
+    modelLoading: Boolean,
+    stopping: Boolean,
+    elapsed: Long,
+    audioLevel: Float,
+    activeModelId: String?,
+    backend: InferenceBackend?,
+    indicatorAlpha: Float,
+) {
+    if (!recording && !modelLoading && !stopping) return
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.ExtraSmall),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .graphicsLayer { alpha = indicatorAlpha }
+                .background(if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, CircleShape)
+                .semantics { contentDescription = if (recording) "Recording active" else "Recording stopped" },
+        )
+        Text(
+            compactRecordingLabel(recording, modelLoading, stopping, elapsed, activeModelId, backend),
+            style = MaterialTheme.typography.labelSmall,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (recording && !modelLoading) AudioLevelMeter(audioLevel)
+    }
+}
+
+private fun compactRecordingLabel(
+    recording: Boolean,
+    modelLoading: Boolean,
+    stopping: Boolean,
+    elapsed: Long,
+    activeModelId: String?,
+    backend: InferenceBackend?,
+): String = when {
+    stopping -> "Finishing"
+    modelLoading -> "Loading ${localModelDisplayName(activeModelId)}"
+    recording -> "Recording %02d:%02d".format(elapsed / 60, elapsed % 60)
+    activeModelId != null -> localModelDisplayName(activeModelId)
+    backend != null -> backend.label
+    else -> ""
 }
 
 @Composable private fun Splitter(modifier: Modifier, vertical: Boolean, onDrag: (Float) -> Unit) {
@@ -411,7 +588,7 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
     Card(
         modifier = modifier.testTag("context-card"),
         shape = MaterialTheme.shapes.extraLarge,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f)),
+        border = BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.72f)),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.primaryContainer,
             contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
@@ -452,13 +629,6 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
                     horizontalAlignment = Alignment.Start,
                     verticalArrangement = Arrangement.Center,
                 ) {
-                    Icon(
-                        painter = painterResource(R.drawable.ic_context_empty),
-                        contentDescription = null,
-                        modifier = Modifier.size(54.dp),
-                        tint = Color.Unspecified,
-                    )
-                    Spacer(Modifier.height(ListenerSpacing.Small))
                     Text(
                         "Follow the conversation",
                         style = MaterialTheme.typography.titleLarge,
@@ -896,22 +1066,8 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     recordingAvailable: Boolean,
     modelLoading: Boolean,
     stopping: Boolean,
-    elapsed: Long,
-    audioLevel: Float,
-    activeModelId: String?,
-    backend: InferenceBackend?,
-    statusMessage: String?,
-    statusIsError: Boolean,
-    downloadModelId: String?,
-    downloadProgress: Float?,
-    onCancelDownload: () -> Unit,
     toggle: () -> Unit,
 ) {
-    val indicatorAlpha by animateFloatAsState(
-        targetValue = if (recording) 0.55f + audioLevel * 0.45f else 0.28f,
-        animationSpec = tween(ListenerMotion.FastDurationMillis),
-        label = "recording indicator",
-    )
     val actionCorner by animateDpAsState(
         targetValue = if (recording) 18.dp else 30.dp,
         animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
@@ -922,59 +1078,24 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
         animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
         label = "record action color",
     )
-    Column(Modifier.fillMaxWidth().padding(top = ListenerSpacing.Small).testTag("listening-controls")) {
-        if (recording || modelLoading || stopping) {
-            RecordingStatusStrip(
-                recording = recording,
-                modelLoading = modelLoading,
-                stopping = stopping,
-                elapsed = elapsed,
-                audioLevel = audioLevel,
-                activeModelId = activeModelId,
-                backend = backend,
-                indicatorAlpha = indicatorAlpha,
-            )
-        }
-        statusMessage?.let { message ->
-            Surface(
-                color = if (statusIsError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
-                contentColor = if (statusIsError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
-                shape = MaterialTheme.shapes.small,
-                modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.Small).testTag("local-status"),
-            ) {
-                Row(
-                    Modifier.fillMaxWidth().padding(ListenerSpacing.Medium),
-                    horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(message, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                    if (downloadModelId != null) {
-                        TextButton(onClick = onCancelDownload) { Text("Cancel install") }
-                    }
-                }
-            }
-        }
-        if (downloadModelId != null) {
-            DownloadStatus(
-                modelId = downloadModelId,
-                progress = downloadProgress,
-                onCancel = onCancelDownload,
-                modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.Small),
-            )
-        }
+    val buttonEnabled = !stopping
+    Column(Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).testTag("listening-controls")) {
         Button(
-            enabled = !stopping && (recording || recordingAvailable),
+            enabled = buttonEnabled,
             onClick = toggle,
-            modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.Medium).heightIn(min = 58.dp).testTag("record-toggle"),
+            modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).heightIn(min = 58.dp).testTag("record-toggle"),
             shape = RoundedCornerShape(actionCorner),
-            colors = ButtonDefaults.buttonColors(containerColor = actionColor),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (recordingAvailable || recording || modelLoading) actionColor else MaterialTheme.colorScheme.surfaceContainerHighest,
+                contentColor = if (recordingAvailable || recording || modelLoading) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+            ),
         ) {
             val action = when {
                 stopping -> "Finishing..."
                 modelLoading -> "Cancel"
                 recording -> "Stop listening"
                 recordingAvailable -> "Start listening"
-                else -> "Model required"
+                else -> "Install model"
             }
             AnimatedContent(targetState = action, label = "record action") { label ->
                 Row(
@@ -998,111 +1119,6 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
                 }
             }
         }
-    }
-}
-
-@Composable private fun RecordingStatusStrip(
-    recording: Boolean,
-    modelLoading: Boolean,
-    stopping: Boolean,
-    elapsed: Long,
-    audioLevel: Float,
-    activeModelId: String?,
-    backend: InferenceBackend?,
-    indicatorAlpha: Float,
-) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        contentColor = MaterialTheme.colorScheme.onSurface,
-        shape = MaterialTheme.shapes.medium,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
-        modifier = Modifier.fillMaxWidth().padding(bottom = ListenerSpacing.Small),
-    ) {
-        Column(Modifier.fillMaxWidth().padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.Small)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Box(
-                    Modifier
-                        .size(10.dp)
-                        .graphicsLayer { alpha = indicatorAlpha }
-                        .background(if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, CircleShape),
-                )
-                AnimatedContent(
-                    targetState = Triple(recording, modelLoading, stopping),
-                    modifier = Modifier.weight(1f),
-                    label = "recording status",
-                ) { state ->
-                    val text = when {
-                        state.third -> "Finishing transcript..."
-                        state.second -> "Loading ${localModelDisplayName(activeModelId)}..."
-                        state.first -> "Recording  %02d:%02d".format(elapsed / 60, elapsed % 60)
-                        else -> ""
-                    }
-                    Text(
-                        text,
-                        style = MaterialTheme.typography.labelLarge,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.semantics { contentDescription = if (recording) "Recording active" else "Recording stopped" },
-                    )
-                }
-                if (recording && !modelLoading) AudioLevelMeter(audioLevel)
-            }
-            if (activeModelId != null || backend != null) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(start = 18.dp, top = ListenerSpacing.ExtraSmall),
-                    horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    activeModelId?.let {
-                        TinyInfoChip(localModelDisplayName(it), "Active model ${localModelDisplayName(it)}")
-                    }
-                    backend?.let {
-                        TinyInfoChip(it.label, "Inference backend ${it.label}")
-                    }
-                }
-            }
-        }
-    }
-}
-
-@Composable private fun DownloadStatus(modelId: String, progress: Float?, onCancel: () -> Unit, modifier: Modifier = Modifier) {
-    Surface(
-        color = MaterialTheme.colorScheme.surfaceContainerLow,
-        contentColor = MaterialTheme.colorScheme.onSurface,
-        shape = MaterialTheme.shapes.small,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)),
-        modifier = modifier,
-    ) {
-        Column(Modifier.padding(ListenerSpacing.Medium), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.Small)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    if (progress == null) "Installing ${localModelDisplayName(modelId)}" else "Installing ${localModelDisplayName(modelId)} ${(progress * 100).toInt()}%",
-                    style = MaterialTheme.typography.bodySmall,
-                    modifier = Modifier.weight(1f),
-                )
-                TextButton(onClick = onCancel) { Text("Cancel") }
-            }
-            LinearProgressIndicator(progress = { progress ?: 0f }, modifier = Modifier.fillMaxWidth())
-        }
-    }
-}
-
-@Composable private fun TinyInfoChip(label: String, description: String) {
-    Surface(color = MaterialTheme.colorScheme.secondaryContainer, shape = MaterialTheme.shapes.large) {
-        Text(
-            label,
-            Modifier
-                .padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.ExtraSmall)
-                .semantics { contentDescription = description },
-            color = MaterialTheme.colorScheme.onSecondaryContainer,
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
     }
 }
 

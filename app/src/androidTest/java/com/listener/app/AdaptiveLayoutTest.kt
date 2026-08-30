@@ -56,11 +56,12 @@ class AdaptiveLayoutTest {
     @Test fun emptyListenStateExplainsBothPanels() {
         setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
 
+        compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
         compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
         compose.onNodeWithText("Follow the conversation").assertExists()
         compose.onNodeWithText("Your English context will appear here once you start listening.").assertExists()
         compose.onNodeWithTag("transcript-empty").assertExists()
-        compose.onNodeWithText("The original transcript will appear here.").assertExists()
+        compose.onNodeWithText("Traditional Chinese will appear here.").assertExists()
     }
 
     @Test fun loadingStateKeepsCommittedContextVisibleAndOffersCancel() {
@@ -82,13 +83,14 @@ class AdaptiveLayoutTest {
             )
         }
 
+        compose.onNodeWithTag("listen-header-status").assertExists()
         compose.onNodeWithTag("context-current-detail").assertExists()
         compose.onNodeWithContentDescription("Loading English context").assertExists()
         compose.onNodeWithTag("model-loading-indicator", useUnmergedTree = true).assertExists()
         compose.onNodeWithText("Cancel").assertExists()
     }
 
-    @Test fun localErrorsStayInRecordingControls() {
+    @Test fun localErrorsDoNotReserveListenHeaderSpaceWhenIdle() {
         setTestContent {
             ListeningScreen(
                 recording = false,
@@ -101,7 +103,8 @@ class AdaptiveLayoutTest {
             )
         }
 
-        compose.onNodeWithTag("local-status").assertExists()
+        compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
+        compose.onNodeWithTag("local-status").assertDoesNotExist()
         compose.onNodeWithTag("english-context-status").assertDoesNotExist()
     }
 
@@ -135,11 +138,11 @@ class AdaptiveLayoutTest {
     }
     @Test fun recordingRequiresInstalledModel() {
         setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, recordingAvailable = false) }
-        compose.onNodeWithTag("record-toggle").assertIsNotEnabled()
-        compose.onNodeWithText("Model required").assertExists()
+        compose.onNodeWithTag("record-toggle").assertIsEnabled()
+        compose.onNodeWithText("Install model").assertExists()
     }
 
-    @Test fun modelInstallPromptOffersCancelOnListenScreen() {
+    @Test fun modelInstallProgressDoesNotAppearOnListenScreen() {
         setTestContent {
             ListeningScreen(
                 recording = false,
@@ -154,10 +157,10 @@ class AdaptiveLayoutTest {
             )
         }
 
-        compose.onNodeWithTag("local-status").assertExists()
-        compose.onNodeWithText("Cancel install").assertExists()
-        compose.onNodeWithText("Installing Sherpa Paraformer 42%").assertExists()
-        compose.onNodeWithText("Cancel").assertExists()
+        compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
+        compose.onNodeWithTag("local-status").assertDoesNotExist()
+        compose.onNodeWithText("42% Sherpa Paraformer").assertDoesNotExist()
+        compose.onNodeWithText("Cancel").assertDoesNotExist()
     }
 
     @Test fun provisionalTextAndBackendHaveAccessibleState() {
@@ -310,6 +313,34 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("Automatic summaries are off.").assertExists()
         compose.onNodeWithContentDescription("English context summaries").assertIsOff().performClick()
         compose.runOnIdle { assertTrue(enabled) }
+    }
+
+    @Test fun summaryModelInfoDialogCloseButtonDismissesPopup() {
+        setTestContent {
+            MaterialTheme {
+                RemoteSettings(
+                    apiKeyPresent = false,
+                    groqApiKeyPresent = false,
+                    remoteEnabled = true,
+                    retentionDays = 30,
+                    selectedModel = "openrouter/free",
+                    catalog = emptyList(),
+                    catalogLoading = false,
+                    message = null,
+                    onSaveKey = {},
+                    onClearKey = {},
+                    onRemoteEnabled = {},
+                    onRetentionDays = {},
+                    onRefreshCatalog = {},
+                    onSelectRemoteModel = {},
+                )
+            }
+        }
+
+        compose.onNodeWithContentDescription("About summary models").performClick()
+        compose.onAllNodesWithText("Summary model").assertCountEquals(2)
+        compose.onNodeWithContentDescription("Close").assertIsDisplayed().performClick()
+        compose.onAllNodesWithText("Summary model").assertCountEquals(1)
     }
 
     @Test fun groqCadenceSliderCannotGoBelowTwoSeconds() {

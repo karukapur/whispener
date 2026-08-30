@@ -17,6 +17,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -399,12 +400,12 @@ private fun ModelInfoDialog(
                     Text("Summary model", style = MaterialTheme.typography.titleLarge, modifier = Modifier.weight(1f))
                     IconButton(
                         onClick = onDismiss,
-                        modifier = Modifier.size(48.dp),
+                        modifier = Modifier.size(40.dp).clip(CircleShape).background(MaterialTheme.colorScheme.surfaceContainerHigh),
                     ) {
                         Icon(
                             painter = painterResource(R.drawable.ic_close),
                             contentDescription = "Close",
-                            modifier = Modifier.size(24.dp),
+                            modifier = Modifier.size(20.dp),
                             tint = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
                     }

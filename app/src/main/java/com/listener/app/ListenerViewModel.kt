@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.ClipData
 import android.content.Context
 import android.content.Intent
+import android.widget.Toast
 import android.net.Uri
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -257,6 +258,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                         label = "start_recording_blocked",
                         fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf("reason" to "sherpa_model_missing"),
                     )
+                    Toast.makeText(context, "Download a model from Models before listening.", Toast.LENGTH_SHORT).show()
                     ListeningRuntime.update {
                         it.copy(
                             backend = InferenceBackend.SHERPA_ONNX,
@@ -287,6 +289,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 label = "start_recording_blocked",
                 fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf("reason" to "local_model_missing"),
             )
+            Toast.makeText(context, "Download a model from Models before listening.", Toast.LENGTH_SHORT).show()
             ListeningRuntime.update { it.copy(recoverableError = "Download and select a local model before recording.") }
             return
         }
