@@ -8,3 +8,5 @@ local.properties
 captures/
 .foglamp/
 experiments/cadence_expts/results/
+traces/files
+artifacts/

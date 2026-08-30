@@ -277,13 +277,13 @@ private tailrec fun Context.findActivity(): Activity? = when (this) {
     minimumIntervalMillis: Int = MIN_SUMMARY_CADENCE_MILLIS,
 ) {
     val resolvedContextState = contextState ?: legacyContextState(globalContext, details)
-    BoxWithConstraints(Modifier.fillMaxSize().padding(ListenerSpacing.Medium).testTag("adaptive-root")) {
+    BoxWithConstraints(Modifier.fillMaxSize().padding(24.dp).testTag("adaptive-root")) {
         val wide = maxWidth >= 600.dp && maxWidth > maxHeight
         val density = LocalDensity.current
         var contextRatio by rememberSaveable { mutableFloatStateOf(0.6f) }
         val maxWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
         val maxHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
-        Column(verticalArrangement = Arrangement.spacedBy(ListenerSpacing.Small)) {
+        Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.Small)) {
             ScreenTitle("Listen")
             if (wide) {
                 Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
