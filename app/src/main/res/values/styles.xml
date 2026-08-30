@@ -1,7 +1,7 @@
 <resources>
     <style name="Theme.Listener" parent="android:style/Theme.Material.Light.NoActionBar">
         <item name="android:fontFamily">sans</item>
-        <item name="android:colorAccent">#3567A8</item>
-        <item name="android:windowBackground">#F7F9FC</item>
+        <item name="android:colorAccent">#246EAF</item>
+        <item name="android:windowBackground">#FBFAFF</item>
     </style>
 </resources>

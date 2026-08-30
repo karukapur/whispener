@@ -345,7 +345,6 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         credentialRevision.update(Int::inc)
         catalog.value = listOf(openRouterFreeRouterModel())
         remoteMessage.value = null
-        if (app.keyStore.readGroq() == null) viewModelScope.launch { app.preferences.setRemoteEnabled(false) }
     }
 
     fun refreshCatalog() {
@@ -394,7 +393,14 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     fun cancelDownload() {
         download.value.workId?.let(app.models::cancel)
-        download.value = ModelDownloadState(error = "Download cancelled")
+        download.value = ModelDownloadState()
+        ListeningRuntime.update {
+            if (!it.recording && it.recoverableError?.contains("Install Paraformer") == true) {
+                it.copy(recoverableError = null, backend = null)
+            } else {
+                it
+            }
+        }
     }
 
     fun deleteModel(id: String) {

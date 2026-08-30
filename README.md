@@ -30,7 +30,7 @@ On first launch:
 1. Review privacy onboarding and continue. The app schedules the pinned 142 MB multilingual Base model download.
 2. Wait for Tiny to show as installed under Models.
 3. Tap Start and grant microphone permission. Permission approval never starts recording by itself; tap Start again if permission was previously denied.
-4. For English context, configure at least one remote key and enable summaries. The default remains `openrouter/free`; Settings also offers five compatible low-latency OpenRouter models and Groq GPT-OSS 20B when `GROQ_API_KEY` is present in a debug build.
+4. For English context, configure at least one remote key and enable summaries. The default is Groq GPT-OSS 20B when `GROQ_API_KEY` is present in a debug build; Settings also offers `openrouter/free` and five compatible low-latency OpenRouter models when an OpenRouter key is configured.
 
 ## Data and runtime flow
 

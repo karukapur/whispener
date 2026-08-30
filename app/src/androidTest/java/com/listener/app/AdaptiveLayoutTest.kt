@@ -1,5 +1,7 @@
 package com.listener.app
 
+import android.content.pm.ActivityInfo
+import android.content.res.Configuration
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.foundation.layout.Box
@@ -19,6 +21,7 @@ import com.listener.app.ui.RemoteSettings
 import com.listener.app.ui.SessionActions
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.After
 import org.junit.Rule
 import org.junit.Test
 
@@ -29,10 +32,23 @@ class AdaptiveLayoutTest {
         compose.setContent(content)
     }
 
+    @After fun resetOrientation() {
+        compose.activity.requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    }
+
+    private fun requestOrientation(orientation: Int, expected: Int) {
+        compose.activity.requestedOrientation = orientation
+        compose.waitUntil(timeoutMillis = 5_000) {
+            compose.activity.resources.configuration.orientation == expected
+        }
+    }
+
     @Test fun foldedLayoutKeepsTranscriptAndControlVisible() {
         setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
         compose.onNodeWithTag("transcript").assertExists(); compose.onNodeWithTag("record-toggle").assertIsDisplayed()
         compose.onNodeWithText("English context").assertExists()
+        compose.onNodeWithText("Listen").assertExists()
+        compose.onNodeWithText("Summary interval").assertDoesNotExist()
         compose.onNodeWithText("English context will appear after remote summaries are enabled.").assertDoesNotExist()
         compose.onNodeWithText("Summary trace").assertDoesNotExist()
     }
@@ -41,9 +57,10 @@ class AdaptiveLayoutTest {
         setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
 
         compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
-        compose.onNodeWithText("English context will appear here once finalized Chinese speech is summarized.").assertExists()
+        compose.onNodeWithText("Follow the conversation").assertExists()
+        compose.onNodeWithText("Your English context will appear here once you start listening.").assertExists()
         compose.onNodeWithTag("transcript-empty").assertExists()
-        compose.onNodeWithText("Chinese speech will appear here while listening.").assertExists()
+        compose.onNodeWithText("The original transcript will appear here.").assertExists()
     }
 
     @Test fun loadingStateKeepsCommittedContextVisibleAndOffersCancel() {
@@ -65,7 +82,7 @@ class AdaptiveLayoutTest {
             )
         }
 
-        compose.onNodeWithText("Committed detail").assertExists()
+        compose.onNodeWithTag("context-current-detail").assertExists()
         compose.onNodeWithContentDescription("Loading English context").assertExists()
         compose.onNodeWithTag("model-loading-indicator", useUnmergedTree = true).assertExists()
         compose.onNodeWithText("Cancel").assertExists()
@@ -89,18 +106,19 @@ class AdaptiveLayoutTest {
     }
 
     @Test fun listenPanelsRemainSideBySideInWideLandscape() {
+        requestOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, Configuration.ORIENTATION_LANDSCAPE)
         setTestContent {
-            Box(Modifier.size(width = 800.dp, height = 480.dp)) {
-                ListeningScreen(false, 0, 5_000, {}, {})
-            }
+            ListeningScreen(false, 0, 5_000, {}, {})
         }
 
         val context = compose.onNodeWithTag("context-card").getUnclippedBoundsInRoot()
         val transcript = compose.onNodeWithTag("transcript").getUnclippedBoundsInRoot()
-        assertTrue(context.right <= transcript.left)
+        assertTrue(context.left < transcript.left)
+        assertTrue(context.top < transcript.bottom && transcript.top < context.bottom)
     }
 
     @Test fun listenPanelsRemainStackedInNarrowPortrait() {
+        requestOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT)
         setTestContent {
             Box(Modifier.size(width = 360.dp, height = 720.dp)) {
                 ListeningScreen(false, 0, 5_000, {}, {})
@@ -119,6 +137,27 @@ class AdaptiveLayoutTest {
         setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, recordingAvailable = false) }
         compose.onNodeWithTag("record-toggle").assertIsNotEnabled()
         compose.onNodeWithText("Model required").assertExists()
+    }
+
+    @Test fun modelInstallPromptOffersCancelOnListenScreen() {
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onToggle = {},
+                statusMessage = "Install Paraformer before recording.",
+                statusIsError = true,
+                downloadModelId = "sherpa-onnx-streaming-paraformer-bilingual-zh-en",
+                downloadProgress = 0.42f,
+            )
+        }
+
+        compose.onNodeWithTag("local-status").assertExists()
+        compose.onNodeWithText("Cancel install").assertExists()
+        compose.onNodeWithText("Installing Sherpa Paraformer 42%").assertExists()
+        compose.onNodeWithText("Cancel").assertExists()
     }
 
     @Test fun provisionalTextAndBackendHaveAccessibleState() {
@@ -157,10 +196,11 @@ class AdaptiveLayoutTest {
         }
         compose.onNodeWithTag("context-heading").assertIsDisplayed()
         compose.onNodeWithText("Current topic").assertExists()
-        compose.onNodeWithText("Earlier detail 1").assertExists()
+        compose.onNodeWithTag("context-current-detail").assertExists()
+        compose.onNodeWithTag("context-heading").assertIsDisplayed()
     }
 
-    @Test fun contextHistoryRetainsPriorDetailsAndShowsStreamingDraft() {
+    @Test fun contextCardShowsOnlyCurrentContextWhileStreaming() {
         setTestContent {
             ListeningScreen(
                 recording = true,
@@ -179,24 +219,62 @@ class AdaptiveLayoutTest {
                 ),
             )
         }
-        compose.onNodeWithText("First retained detail").assertExists()
-        compose.onNodeWithText("Newest committed detail").assertExists()
-        compose.onNodeWithContentDescription("Streaming English context update").assertExists()
-        compose.onNodeWithText("Draft detail").assertExists()
+        compose.onNodeWithTag("context-current-detail").assertExists()
+        compose.onNodeWithContentDescription("Loading English context").assertExists()
+        compose.onNodeWithTag("context-draft-detail").assertDoesNotExist()
+        compose.onNodeWithTag("context-history-item").assertDoesNotExist()
     }
 
-    @Test fun cadenceSliderShowsDecimalValuesAndReportsSnappedMillis() {
-        var selected = 0
+    @Test fun currentEnglishContextIsNotRepeatedBelowStatus() {
+        val current = ListeningContext("Newest committed topic", listOf("Newest committed detail"))
         setTestContent {
             ListeningScreen(
-                recording = false,
-                elapsedSeconds = 0,
-                intervalMillis = 2_500,
-                onIntervalChange = { millis: Int -> selected = millis },
+                recording = true,
+                elapsedSeconds = 2,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
                 onToggle = {},
+                contextState = StreamingContextState(
+                    current = current,
+                    history = listOf(
+                        ContextHistoryEntry(ListeningContext("Earlier topic", listOf("Earlier detail")), 1L),
+                        ContextHistoryEntry(current, 2L),
+                    ),
+                ),
             )
         }
-        compose.onNodeWithText("Summary every 2.5s").assertExists()
+
+        compose.onNodeWithTag("context-heading").assertIsDisplayed()
+        compose.onNodeWithTag("context-current-detail").assertExists()
+        compose.onNodeWithTag("context-history-item").assertDoesNotExist()
+    }
+
+    @Test fun settingsCadenceSliderShowsDecimalValuesAndReportsSnappedMillis() {
+        var selected = 2_000
+        setTestContent {
+            MaterialTheme {
+                RemoteSettings(
+                    apiKeyPresent = false,
+                    groqApiKeyPresent = false,
+                    remoteEnabled = true,
+                    retentionDays = 30,
+                    selectedModel = "openrouter/free",
+                    catalog = emptyList(),
+                    catalogLoading = false,
+                    message = null,
+                    onSaveKey = {},
+                    onClearKey = {},
+                    onRemoteEnabled = {},
+                    onRetentionDays = {},
+                    onRefreshCatalog = {},
+                    onSelectRemoteModel = {},
+                    summaryCadenceMillis = 2_500,
+                    onSummaryCadenceChange = { millis: Int -> selected = millis },
+                )
+            }
+        }
+        compose.onNodeWithText("Summary interval").assertExists()
+        compose.onNodeWithText("Every 2.5s").assertExists()
         compose.onNodeWithContentDescription("Summary cadence 2.5s").assertExists()
         compose.onNodeWithTag("cadence-slider").performTouchInput { swipeLeft() }
         compose.runOnIdle {
@@ -205,21 +283,64 @@ class AdaptiveLayoutTest {
         }
     }
 
+    @Test fun remoteSettingsShowsEnglishContextSwitch() {
+        var enabled = false
+        setTestContent {
+            MaterialTheme {
+                RemoteSettings(
+                    apiKeyPresent = false,
+                    groqApiKeyPresent = false,
+                    remoteEnabled = enabled,
+                    retentionDays = 30,
+                    selectedModel = "openrouter/free",
+                    catalog = emptyList(),
+                    catalogLoading = false,
+                    message = null,
+                    onSaveKey = {},
+                    onClearKey = {},
+                    onRemoteEnabled = { enabled = it },
+                    onRetentionDays = {},
+                    onRefreshCatalog = {},
+                    onSelectRemoteModel = {},
+                )
+            }
+        }
+
+        compose.onNodeWithText("English context").assertExists()
+        compose.onNodeWithText("Automatic summaries are off.").assertExists()
+        compose.onNodeWithContentDescription("English context summaries").assertIsOff().performClick()
+        compose.runOnIdle { assertTrue(enabled) }
+    }
+
     @Test fun groqCadenceSliderCannotGoBelowTwoSeconds() {
         var selected = 0
         setTestContent {
-            ListeningScreen(
-                recording = false,
-                elapsedSeconds = 0,
-                intervalMillis = 500,
-                onIntervalChange = { selected = it },
-                onToggle = {},
-                minimumIntervalMillis = 2_000,
-            )
+            MaterialTheme {
+                RemoteSettings(
+                    apiKeyPresent = false,
+                    groqApiKeyPresent = true,
+                    remoteEnabled = true,
+                    retentionDays = 30,
+                    selectedModel = GROQ_GPT_OSS_20B_REMOTE_MODEL_ID,
+                    catalog = emptyList(),
+                    catalogLoading = false,
+                    message = null,
+                    onSaveKey = {},
+                    onClearKey = {},
+                    onRemoteEnabled = {},
+                    onRetentionDays = {},
+                    onRefreshCatalog = {},
+                    onSelectRemoteModel = {},
+                    summaryCadenceMillis = 500,
+                    onSummaryCadenceChange = { selected = it },
+                )
+            }
         }
 
-        compose.onNodeWithText("Summary every 2s").assertExists()
-        compose.onNodeWithContentDescription("Summary cadence 2s").performTouchInput { swipeRight() }
+        compose.onNodeWithText("Summary interval").assertExists()
+        compose.onNodeWithText("Every 2s").assertExists()
+        compose.onNodeWithText("Groq uses this cadence with a 2s minimum.").assertExists()
+        compose.onNodeWithContentDescription("Summary cadence 2s").performTouchInput { swipeLeft() }
         compose.runOnIdle { assertTrue(selected >= 2_000) }
     }
 

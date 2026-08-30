@@ -11,6 +11,7 @@ private val Context.listenerDataStore by preferencesDataStore("listener_preferen
 const val OPENROUTER_FREE_ROUTER_MODEL_ID = "openrouter/free"
 const val DEFAULT_OPENROUTER_MODEL_ID = OPENROUTER_FREE_ROUTER_MODEL_ID
 const val GROQ_GPT_OSS_20B_REMOTE_MODEL_ID = "groq/openai/gpt-oss-20b"
+const val DEFAULT_REMOTE_MODEL_ID = GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
 const val GROQ_MIN_SUMMARY_CADENCE_MILLIS = 2_000
 const val MIN_SUMMARY_CADENCE_MILLIS = 500
 const val MAX_SUMMARY_CADENCE_MILLIS = 10_000
@@ -19,9 +20,9 @@ const val DEFAULT_SUMMARY_CADENCE_MILLIS = 5_000
 
 data class ListenerPreferences(
     val onboardingComplete: Boolean = false,
-    val remoteEnabled: Boolean = false,
+    val remoteEnabled: Boolean = true,
     val retentionDays: Int = 30,
-    val selectedModel: String? = DEFAULT_OPENROUTER_MODEL_ID,
+    val selectedModel: String? = DEFAULT_REMOTE_MODEL_ID,
     val selectedLocalModelId: String? = null,
     val transcriptionEngine: TranscriptionEngine = TranscriptionEngine.WHISPER_CPP,
     val whisperWorkProfile: WhisperWorkProfile = WhisperWorkProfile.RESPONSIVE,
@@ -54,6 +55,7 @@ class UserPreferences(private val context: Context) {
     private object Keys {
         val onboarding = booleanPreferencesKey("onboarding_complete")
         val remote = booleanPreferencesKey("remote_enabled")
+        val remoteUserSet = booleanPreferencesKey("remote_enabled_user_set")
         val retention = intPreferencesKey("retention_days")
         val model = stringPreferencesKey("openrouter_model")
         val localModel = stringPreferencesKey("local_whisper_model")
@@ -64,11 +66,12 @@ class UserPreferences(private val context: Context) {
     }
 
     val values: Flow<ListenerPreferences> = context.listenerDataStore.data.map { prefs ->
+        val remoteUserSet = prefs[Keys.remoteUserSet] ?: false
         ListenerPreferences(
             onboardingComplete = prefs[Keys.onboarding] ?: false,
-            remoteEnabled = prefs[Keys.remote] ?: false,
+            remoteEnabled = if (remoteUserSet) prefs[Keys.remote] ?: true else true,
             retentionDays = prefs[Keys.retention] ?: 30,
-            selectedModel = prefs[Keys.model] ?: DEFAULT_OPENROUTER_MODEL_ID,
+            selectedModel = prefs[Keys.model] ?: DEFAULT_REMOTE_MODEL_ID,
             selectedLocalModelId = prefs[Keys.localModel],
             transcriptionEngine = TranscriptionEngine.fromId(prefs[Keys.transcriptionEngine]),
             whisperWorkProfile = WhisperWorkProfile.fromId(prefs[Keys.whisperWorkProfile]),
@@ -82,11 +85,15 @@ class UserPreferences(private val context: Context) {
     suspend fun completeOnboarding(remoteEnabled: Boolean, retentionDays: Int) = context.listenerDataStore.edit {
         it[Keys.onboarding] = true
         it[Keys.remote] = remoteEnabled
+        it[Keys.remoteUserSet] = true
         it[Keys.retention] = retentionDays.coerceIn(0, 90)
         it[Keys.localModel] = "base"
     }
 
-    suspend fun setRemoteEnabled(enabled: Boolean) = context.listenerDataStore.edit { it[Keys.remote] = enabled }
+    suspend fun setRemoteEnabled(enabled: Boolean) = context.listenerDataStore.edit {
+        it[Keys.remote] = enabled
+        it[Keys.remoteUserSet] = true
+    }
     suspend fun setRetentionDays(days: Int) = context.listenerDataStore.edit { it[Keys.retention] = days.coerceIn(0, 90) }
     suspend fun setSelectedModel(id: String, minimumCadenceMillis: Int = MIN_SUMMARY_CADENCE_MILLIS) = context.listenerDataStore.edit {
         it[Keys.model] = id

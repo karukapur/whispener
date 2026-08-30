@@ -3,6 +3,7 @@ package com.listener.app
 import com.listener.app.audio.*
 import com.listener.app.context.*
 import com.listener.app.data.DEFAULT_OPENROUTER_MODEL_ID
+import com.listener.app.data.DEFAULT_REMOTE_MODEL_ID
 import com.listener.app.data.DEFAULT_SUMMARY_CADENCE_MILLIS
 import com.listener.app.data.GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
 import com.listener.app.data.GROQ_MIN_SUMMARY_CADENCE_MILLIS
@@ -252,9 +253,10 @@ class CoreLogicTest {
         assertTrue(text.contains("summary_attempt_skipped"))
     }
 
-    @Test fun defaultOpenRouterModelUsesFreeRouter() {
+    @Test fun defaultRemoteModelUsesGroqGptOss20b() {
         assertEquals("openrouter/free", DEFAULT_OPENROUTER_MODEL_ID)
-        assertEquals(DEFAULT_OPENROUTER_MODEL_ID, com.listener.app.data.ListenerPreferences().selectedModel)
+        assertEquals(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID, DEFAULT_REMOTE_MODEL_ID)
+        assertEquals(DEFAULT_REMOTE_MODEL_ID, com.listener.app.data.ListenerPreferences().selectedModel)
     }
 
     @Test fun openRouterCatalogAlwaysIncludesFreeRouterFallback() {

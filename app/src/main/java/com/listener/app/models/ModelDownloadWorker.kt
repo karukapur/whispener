@@ -247,7 +247,7 @@ class ModelDownloadWorker(context: Context, params: WorkerParameters) : Coroutin
         )
         val percent = progress?.let { (it.coerceIn(0f, 1f) * 100).toInt() }
         val notification = NotificationCompat.Builder(applicationContext, CHANNEL)
-            .setSmallIcon(android.R.drawable.stat_sys_download)
+            .setSmallIcon(R.drawable.ic_nav_models)
             .setContentTitle(applicationContext.getString(R.string.app_name))
             .setContentText(if (percent == null) "Preparing model download" else "Downloading model: $percent%")
             .setOngoing(true)
