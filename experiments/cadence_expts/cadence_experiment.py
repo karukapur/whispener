@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standalone OpenRouter cadence sweep for Listener English-context summaries."""
+"""Standalone cadence sweep for Listener English-context summaries."""
 
 from __future__ import annotations
 
@@ -25,9 +25,11 @@ except Exception:
 
 
 DEFAULT_MODEL = "openrouter/free"
+DEFAULT_GROQ_MODEL = "openai/gpt-oss-20b"
 DEFAULT_CADENCES = "2,3,5,8,10,15"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models?sort=latency-low-to-high&supported_parameters=structured_outputs"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where()) if certifi else ssl.create_default_context()
 
 TRADITIONAL_CHINESE_SCRIPT = """
@@ -46,6 +48,7 @@ TRADITIONAL_CHINESE_SCRIPT = """
 @dataclass
 class AttemptRecord:
     run_id: str
+    provider: str
     model: str
     stream: bool
     cadence_seconds: float
@@ -60,17 +63,51 @@ class AttemptRecord:
     details_count: int
     response_global_context: str
     error_detail: str
+    retry_after: str = ""
+    rate_limit_limit_requests: str = ""
+    rate_limit_remaining_requests: str = ""
+    rate_limit_reset_requests: str = ""
+    rate_limit_limit_tokens: str = ""
+    rate_limit_remaining_tokens: str = ""
+    rate_limit_reset_tokens: str = ""
     mode: str = "cadence"
     strategy_order: int = 0
     strategy_name: str = ""
+
+
+@dataclass(frozen=True)
+class ProviderConfig:
+    name: str
+    url: str
+    env_key: str
+    default_model: str
+    supports_streaming: bool
+
+
+PROVIDERS = {
+    "openrouter": ProviderConfig(
+        name="openrouter",
+        url=OPENROUTER_URL,
+        env_key="OPENROUTER_API_KEY",
+        default_model=DEFAULT_MODEL,
+        supports_streaming=True,
+    ),
+    "groq": ProviderConfig(
+        name="groq",
+        url=GROQ_URL,
+        env_key="GROQ_API_KEY",
+        default_model=DEFAULT_GROQ_MODEL,
+        supports_streaming=False,
+    ),
+}
 
 
 def compact_transcript(text: str) -> str:
     return " ".join(line.strip() for line in text.splitlines() if line.strip())
 
 
-def transcript_chunks(text: str, chunk_size: int) -> list[str]:
-    compact = compact_transcript(text)
+def transcript_chunks(text: str, chunk_size: int, script_repeats: int = 1) -> list[str]:
+    compact = " ".join([compact_transcript(text)] * max(1, script_repeats))
     return [compact[index : index + chunk_size] for index in range(0, len(compact), chunk_size)]
 
 
@@ -137,7 +174,15 @@ New finalized Chinese delta:
 """.strip()
 
 
-def build_payload(model: str, stream: bool, previous_summary: dict[str, Any] | None, tail: str, delta: str, prompt_profile: str = "default") -> bytes:
+def build_payload(
+    provider: ProviderConfig,
+    model: str,
+    stream: bool,
+    previous_summary: dict[str, Any] | None,
+    tail: str,
+    delta: str,
+    prompt_profile: str = "default",
+) -> bytes:
     max_items = 3 if prompt_profile == "tight" else 6
     max_tokens = 220 if prompt_profile == "tight" else 360
     payload = {
@@ -172,22 +217,29 @@ def build_payload(model: str, stream: bool, previous_summary: dict[str, Any] | N
             },
         },
         "temperature": 0,
-        "max_tokens": max_tokens,
-        "provider": {
+    }
+    if provider.name == "groq":
+        payload["max_completion_tokens"] = max_tokens
+        payload["reasoning_effort"] = "low"
+    else:
+        payload["max_tokens"] = max_tokens
+        payload["provider"] = {
             "require_parameters": True,
             "max_price": {"prompt": 0, "completion": 0},
-        },
-    }
+        }
     return json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
 
 def sanitized_error(error: BaseException) -> str:
     text = f"{type(error).__name__}: {error}"
     text = re.sub(r"sk-or-v1-[A-Za-z0-9._-]+", "[REDACTED]", text)
+    text = re.sub(r"gsk[_-][A-Za-z0-9._-]+", "[REDACTED]", text)
+    text = re.sub(r"org_[A-Za-z0-9]+", "org_[REDACTED]", text)
     return text[:240]
 
 
 def request_context(
+    provider: ProviderConfig,
     api_key: str,
     model: str,
     stream: bool,
@@ -196,10 +248,10 @@ def request_context(
     delta: str,
     parser_profile: str = "strict",
     prompt_profile: str = "default",
-) -> tuple[bool, str, int, dict[str, Any] | None, str]:
+) -> tuple[bool, str, int, dict[str, Any] | None, str, dict[str, str]]:
     request = urllib.request.Request(
-        OPENROUTER_URL,
-        data=build_payload(model, stream, previous_summary, tail, delta, prompt_profile),
+        provider.url,
+        data=build_payload(provider, model, stream, previous_summary, tail, delta, prompt_profile),
         method="POST",
         headers={
             "Authorization": f"Bearer {api_key.strip()}",
@@ -213,19 +265,20 @@ def request_context(
     try:
         with urllib.request.urlopen(request, timeout=30, context=SSL_CONTEXT) as response:
             body = response.read()
+            limit_headers = rate_limit_headers(response.headers)
         latency_ms = int((time.monotonic() - start) * 1000)
         try:
             context = parse_streaming_context(body, parser_profile) if stream else parse_context(body, parser_profile)
-            return True, "Success", latency_ms, context, ""
+            return True, "Success", latency_ms, context, "", limit_headers
         except Exception as error:
-            return False, "InvalidResponse", latency_ms, None, sanitized_error(error)
+            return False, "InvalidResponse", latency_ms, None, sanitized_error(error), limit_headers
     except urllib.error.HTTPError as error:
         latency_ms = int((time.monotonic() - start) * 1000)
-        return False, http_status(error.code), latency_ms, None, sanitized_error(error)
+        return False, http_status(error.code), latency_ms, None, sanitized_http_error(error), rate_limit_headers(error.headers)
     except TimeoutError as error:
-        return False, "TimedOut", int((time.monotonic() - start) * 1000), None, sanitized_error(error)
+        return False, "TimedOut", int((time.monotonic() - start) * 1000), None, sanitized_error(error), empty_rate_limit_headers()
     except OSError as error:
-        return False, "Offline", int((time.monotonic() - start) * 1000), None, sanitized_error(error)
+        return False, "Offline", int((time.monotonic() - start) * 1000), None, sanitized_error(error), empty_rate_limit_headers()
 
 
 def http_status(code: int) -> str:
@@ -235,6 +288,47 @@ def http_status(code: int) -> str:
         408: "TimedOut",
         429: "RateLimited",
     }.get(code, f"HTTP{code}")
+
+
+def sanitized_http_error(error: urllib.error.HTTPError) -> str:
+    body = ""
+    try:
+        body = error.read().decode("utf-8", errors="replace")
+    except Exception:
+        pass
+    text = f"HTTPError {error.code}: {body or error.reason}"
+    text = re.sub(r"sk-or-v1-[A-Za-z0-9._-]+", "[REDACTED]", text)
+    text = re.sub(r"gsk[_-][A-Za-z0-9._-]+", "[REDACTED]", text)
+    text = re.sub(r"org_[A-Za-z0-9]+", "org_[REDACTED]", text)
+    return text[:240]
+
+
+def empty_rate_limit_headers() -> dict[str, str]:
+    return {
+        "retry_after": "",
+        "rate_limit_limit_requests": "",
+        "rate_limit_remaining_requests": "",
+        "rate_limit_reset_requests": "",
+        "rate_limit_limit_tokens": "",
+        "rate_limit_remaining_tokens": "",
+        "rate_limit_reset_tokens": "",
+    }
+
+
+def rate_limit_headers(headers: Any) -> dict[str, str]:
+    def header(name: str) -> str:
+        value = headers.get(name, "") if headers is not None else ""
+        return str(value)[:160] if value else ""
+
+    return {
+        "retry_after": header("retry-after"),
+        "rate_limit_limit_requests": header("x-ratelimit-limit-requests"),
+        "rate_limit_remaining_requests": header("x-ratelimit-remaining-requests"),
+        "rate_limit_reset_requests": header("x-ratelimit-reset-requests"),
+        "rate_limit_limit_tokens": header("x-ratelimit-limit-tokens"),
+        "rate_limit_remaining_tokens": header("x-ratelimit-remaining-tokens"),
+        "rate_limit_reset_tokens": header("x-ratelimit-reset-tokens"),
+    }
 
 
 def parse_context(body: bytes, parser_profile: str = "strict") -> dict[str, Any]:
@@ -325,22 +419,23 @@ def percentile(values: list[int], pct: float) -> int | None:
     return ordered[round((len(ordered) - 1) * pct)]
 
 
-def run_cadence(api_key: str, run_id: str, model: str, stream: bool, cadence_seconds: float, chunk_size: int, output_jsonl: Path, mode: str = "cadence", parser_profile: str = "strict", prompt_profile: str = "default") -> list[AttemptRecord]:
+def run_cadence(provider: ProviderConfig, api_key: str, run_id: str, model: str, stream: bool, cadence_seconds: float, chunk_size: int, script_repeats: int, output_jsonl: Path, mode: str = "cadence", parser_profile: str = "strict", prompt_profile: str = "default") -> list[AttemptRecord]:
     records: list[AttemptRecord] = []
     transcript = ""
     last_sent = ""
     previous_summary: dict[str, Any] | None = None
-    pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size)
+    pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size, script_repeats)
     for index, chunk in enumerate(pieces, start=1):
         transcript += chunk
         delta = transcript[len(last_sent) :] if transcript.startswith(last_sent) else transcript
         before = len(last_sent)
-        ok, status, latency_ms, context, error_detail = request_context(api_key, model, stream, previous_summary, last_sent[-800:], delta, parser_profile, prompt_profile)
+        ok, status, latency_ms, context, error_detail, limit_headers = request_context(provider, api_key, model, stream, previous_summary, last_sent[-800:], delta, parser_profile, prompt_profile)
         if ok and context is not None:
             last_sent = transcript
             previous_summary = context
         record = AttemptRecord(
             run_id=run_id,
+            provider=provider.name,
             model=model,
             stream=stream,
             cadence_seconds=cadence_seconds,
@@ -355,6 +450,7 @@ def run_cadence(api_key: str, run_id: str, model: str, stream: bool, cadence_sec
             details_count=len(context.get("details", [])) if context else 0,
             response_global_context=context.get("globalContext", "") if context else "",
             error_detail=error_detail,
+            **limit_headers,
             mode=mode,
         )
         records.append(record)
@@ -370,25 +466,27 @@ def run_cadence(api_key: str, run_id: str, model: str, stream: bool, cadence_sec
     return records
 
 
-def run_reliability(api_key: str, run_id: str, model: str, attempts: int, chunk_size: int, pause_seconds: float, output_jsonl: Path) -> list[AttemptRecord]:
+def run_reliability(provider: ProviderConfig, api_key: str, run_id: str, model: str, attempts: int, chunk_size: int, script_repeats: int, pause_seconds: float, output_jsonl: Path) -> list[AttemptRecord]:
     records: list[AttemptRecord] = []
-    for stream in (True, False):
+    stream_modes = (True, False) if provider.supports_streaming else (False,)
+    for stream in stream_modes:
         label = "streaming" if stream else "non_streaming"
         print(f"\nRunning reliability mode {label}...", flush=True)
         transcript = ""
         last_sent = ""
         previous_summary: dict[str, Any] | None = None
-        pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size)
+        pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size, script_repeats)
         for index in range(1, attempts + 1):
             transcript += pieces[(index - 1) % len(pieces)]
             delta = transcript[len(last_sent) :] if transcript.startswith(last_sent) else transcript
             before = len(last_sent)
-            ok, status, latency_ms, context, error_detail = request_context(api_key, model, stream, previous_summary, last_sent[-800:], delta)
+            ok, status, latency_ms, context, error_detail, limit_headers = request_context(provider, api_key, model, stream, previous_summary, last_sent[-800:], delta)
             if ok and context is not None:
                 last_sent = transcript
                 previous_summary = context
             record = AttemptRecord(
                 run_id=run_id,
+                provider=provider.name,
                 model=model,
                 stream=stream,
                 cadence_seconds=pause_seconds,
@@ -403,6 +501,7 @@ def run_reliability(api_key: str, run_id: str, model: str, attempts: int, chunk_
                 details_count=len(context.get("details", [])) if context else 0,
                 response_global_context=context.get("globalContext", "") if context else "",
                 error_detail=error_detail,
+                **limit_headers,
                 mode=label,
             )
             records.append(record)
@@ -444,12 +543,13 @@ def fetch_specific_free_model(api_key: str) -> str | None:
     return None
 
 
-def cheap_strategies(api_key: str, model: str) -> list[Strategy]:
-    specific = fetch_specific_free_model(api_key)
+def cheap_strategies(provider: ProviderConfig, api_key: str, model: str) -> list[Strategy]:
+    specific = fetch_specific_free_model(api_key) if provider.name == "openrouter" else None
+    baseline_stream = provider.supports_streaming
     strategies = [
-        Strategy(1, "eager_validation_baseline", model, True, "strict", "default"),
-        Strategy(2, "tolerant_parser", model, True, "tolerant", "default"),
-        Strategy(3, "tight_prompt_schema", model, True, "strict", "tight"),
+        Strategy(1, "eager_validation_baseline", model, baseline_stream, "strict", "default"),
+        Strategy(2, "tolerant_parser", model, baseline_stream, "tolerant", "default"),
+        Strategy(3, "tight_prompt_schema", model, baseline_stream, "strict", "tight"),
         Strategy(4, "non_streaming_final", model, False, "strict", "default"),
     ]
     if specific is not None:
@@ -459,9 +559,9 @@ def cheap_strategies(api_key: str, model: str) -> list[Strategy]:
     return strategies
 
 
-def run_cheap_strategies(api_key: str, run_id: str, model: str, attempts: int, chunk_size: int, pause_seconds: float, output_jsonl: Path) -> list[AttemptRecord]:
+def run_cheap_strategies(provider: ProviderConfig, api_key: str, run_id: str, model: str, attempts: int, chunk_size: int, script_repeats: int, pause_seconds: float, output_jsonl: Path) -> list[AttemptRecord]:
     all_records: list[AttemptRecord] = []
-    for strategy in cheap_strategies(api_key, model):
+    for strategy in cheap_strategies(provider, api_key, model):
         if strategy.name.endswith(":unavailable"):
             print(f"\nSkipping strategy {strategy.order}: {strategy.name}", flush=True)
             continue
@@ -469,12 +569,13 @@ def run_cheap_strategies(api_key: str, run_id: str, model: str, attempts: int, c
         transcript = ""
         last_sent = ""
         previous_summary: dict[str, Any] | None = None
-        pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size)
+        pieces = transcript_chunks(TRADITIONAL_CHINESE_SCRIPT, chunk_size, script_repeats)
         for index in range(1, attempts + 1):
             transcript += pieces[(index - 1) % len(pieces)]
             delta = transcript[len(last_sent) :] if transcript.startswith(last_sent) else transcript
             before = len(last_sent)
-            ok, status, latency_ms, context, error_detail = request_context(
+            ok, status, latency_ms, context, error_detail, limit_headers = request_context(
+                provider,
                 api_key,
                 strategy.model,
                 strategy.stream,
@@ -489,6 +590,7 @@ def run_cheap_strategies(api_key: str, run_id: str, model: str, attempts: int, c
                 previous_summary = context
             record = AttemptRecord(
                 run_id=run_id,
+                provider=provider.name,
                 model=strategy.model,
                 stream=strategy.stream,
                 cadence_seconds=pause_seconds,
@@ -503,6 +605,7 @@ def run_cheap_strategies(api_key: str, run_id: str, model: str, attempts: int, c
                 details_count=len(context.get("details", [])) if context else 0,
                 response_global_context=context.get("globalContext", "") if context else "",
                 error_detail=error_detail,
+                **limit_headers,
                 mode=f"strategy_{strategy.order}",
                 strategy_order=strategy.order,
                 strategy_name=strategy.name,
@@ -529,6 +632,7 @@ def summarize_records(records: list[AttemptRecord]) -> dict[str, Any]:
         statuses[record.status] = statuses.get(record.status, 0) + 1
     p90 = percentile(success_latencies, 0.9)
     return {
+        "provider": records[0].provider if records else "",
         "cadence_seconds": records[0].cadence_seconds if records else None,
         "mode": records[0].mode if records else None,
         "stream": records[0].stream if records else None,
@@ -547,14 +651,16 @@ def summarize_records(records: list[AttemptRecord]) -> dict[str, Any]:
     }
 
 
-def write_markdown(path: Path, run_id: str, model: str, stream: bool | None, summaries: list[dict[str, Any]], title: str = "Cadence Sweep Evidence") -> None:
+def write_markdown(path: Path, run_id: str, provider: str, model: str, stream: bool | None, summaries: list[dict[str, Any]], script_repeats: int, title: str = "Cadence Sweep Evidence") -> None:
     lines = [
         f"# {title}",
         "",
         f"- Run ID: `{run_id}`",
+        f"- Provider: `{provider}`",
         f"- Model: `{model}`",
         f"- Stream: `{str(stream).lower() if stream is not None else 'mixed'}`",
-        f"- Transcript chars: `{len(compact_transcript(TRADITIONAL_CHINESE_SCRIPT))}`",
+        f"- Transcript chars: `{len(' '.join([compact_transcript(TRADITIONAL_CHINESE_SCRIPT)] * max(1, script_repeats)))}`",
+        f"- Script repeats: `{max(1, script_repeats)}`",
         "",
         "| Mode | Strategy | Model | Cadence/Pause | Attempts | Success | Failures | Statuses | Median ms | P90 ms | Max delta | Pass |",
         "| --- | --- | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | :---: |",
@@ -587,9 +693,11 @@ def parse_cadences(value: str) -> list[float]:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--provider", choices=sorted(PROVIDERS), default="openrouter")
     parser.add_argument("--cadences", type=parse_cadences, default=parse_cadences(DEFAULT_CADENCES))
     parser.add_argument("--chunk-size", type=int, default=72)
-    parser.add_argument("--model", default=DEFAULT_MODEL)
+    parser.add_argument("--script-repeats", type=int, default=1, help="Repeat the fixed transcript to simulate longer sessions.")
+    parser.add_argument("--model", default=None)
     parser.add_argument("--non-streaming", action="store_true", help="Use non-streaming completions instead of app-like SSE streaming.")
     parser.add_argument("--reliability", action="store_true", help="Compare streaming and non-streaming output reliability before cadence tuning.")
     parser.add_argument("--cheap-strategies", action="store_true", help="Run strategy-order experiments 1-5 from strategy_cost_order.md.")
@@ -600,9 +708,11 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).resolve().parent / "results")
     args = parser.parse_args()
 
-    api_key = os.environ.get("OPENROUTER_API_KEY")
+    provider = PROVIDERS[args.provider]
+    model = args.model or provider.default_model
+    api_key = os.environ.get(provider.env_key)
     if not api_key:
-        print("OPENROUTER_API_KEY is not set; refusing to inspect app storage or keystores.")
+        print(f"{provider.env_key} is not set; refusing to inspect app storage or keystores.")
         return 2
     if certifi is None:
         print("Python package certifi is not available; TLS may fail if the system certificate store is incomplete.")
@@ -612,32 +722,33 @@ def main() -> int:
     prefix = "cheap_strategy_sweep" if args.cheap_strategies else "reliability_sweep" if args.reliability else "cadence_sweep"
     output_jsonl = args.output_dir / f"{prefix}_{run_id}.jsonl"
     output_md = args.output_dir / f"{prefix}_{run_id}.md"
-    stream = not args.non_streaming
+    stream = (not args.non_streaming) and provider.supports_streaming
 
     print(f"Run ID: {run_id}", flush=True)
-    print(f"Model: {args.model}", flush=True)
+    print(f"Provider: {provider.name}", flush=True)
+    print(f"Model: {model}", flush=True)
     print(f"Evidence JSONL: {output_jsonl}", flush=True)
 
     summaries: list[dict[str, Any]]
     if args.cheap_strategies:
         print(f"Cheap strategy attempts per mode: {args.reliability_attempts}", flush=True)
         print(f"Pause between attempts: {args.pause_seconds:g}s", flush=True)
-        records = run_cheap_strategies(api_key, run_id, args.model, args.reliability_attempts, args.chunk_size, args.pause_seconds, output_jsonl)
+        records = run_cheap_strategies(provider, api_key, run_id, model, args.reliability_attempts, args.chunk_size, args.script_repeats, args.pause_seconds, output_jsonl)
         summaries = []
         for order in sorted({record.strategy_order for record in records}):
             group = [record for record in records if record.strategy_order == order]
             summaries.append(summarize_records(group))
-        write_markdown(output_md, run_id, args.model, None, summaries, title="Cheap Strategy Evidence")
+        write_markdown(output_md, run_id, provider.name, model, None, summaries, args.script_repeats, title="Cheap Strategy Evidence")
     elif args.reliability:
         print(f"Reliability attempts per mode: {args.reliability_attempts}", flush=True)
         print(f"Pause between attempts: {args.pause_seconds:g}s", flush=True)
-        records = run_reliability(api_key, run_id, args.model, args.reliability_attempts, args.chunk_size, args.pause_seconds, output_jsonl)
+        records = run_reliability(provider, api_key, run_id, model, args.reliability_attempts, args.chunk_size, args.script_repeats, args.pause_seconds, output_jsonl)
         grouped = [
             [record for record in records if record.mode == "streaming"],
             [record for record in records if record.mode == "non_streaming"],
         ]
         summaries = [summarize_records(group) for group in grouped if group]
-        write_markdown(output_md, run_id, args.model, None, summaries, title="Output Reliability Evidence")
+        write_markdown(output_md, run_id, provider.name, model, None, summaries, args.script_repeats, title="Output Reliability Evidence")
     else:
         print(f"Stream: {str(stream).lower()}", flush=True)
         cadences = list(args.cadences)
@@ -647,12 +758,12 @@ def main() -> int:
         summaries = []
         for cadence_index, cadence in enumerate(cadences):
             print(f"\nRunning cadence {cadence:g}s...", flush=True)
-            records = run_cadence(api_key, run_id, args.model, stream, cadence, args.chunk_size, output_jsonl)
+            records = run_cadence(provider, api_key, run_id, model, stream, cadence, args.chunk_size, args.script_repeats, output_jsonl)
             summaries.append(summarize_records(records))
             if cadence_index < len(cadences) - 1 and args.rest_between_cadences > 0:
                 print(f"Resting {args.rest_between_cadences:g}s before next cadence...", flush=True)
                 time.sleep(args.rest_between_cadences)
-        write_markdown(output_md, run_id, args.model, stream, summaries)
+        write_markdown(output_md, run_id, provider.name, model, stream, summaries, args.script_repeats)
 
     print(f"\nEvidence Markdown: {output_md}", flush=True)
     print(output_md.read_text(encoding="utf-8"), flush=True)

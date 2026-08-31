@@ -8,8 +8,8 @@ Usage:
     python3 traces/summarize_trace_for_llm.py --full --max-events 24
 
 The script is intentionally stdlib-only so it can run in a fresh checkout.
-It redacts OpenRouter-style keys defensively even though exported traces should
-already avoid writing secrets.
+It redacts provider keys and organization ids defensively even though exported
+traces should already avoid writing secrets.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ TIMESTAMPED_LINE = re.compile(
     r"(?P<label>[A-Za-z0-9_]+)(?: (?P<fields>.*))?$"
 )
 FIELD_START = re.compile(r"(?<!\S)([A-Za-z][A-Za-z0-9]*)=")
-SECRET = re.compile(r"(?i)(bearer\s+|sk-or-v1-|gsk[_-])[A-Za-z0-9._-]+")
+SECRET = re.compile(r"(?i)(bearer\s+|sk-or-v1-|gsk[_-]|org_)[A-Za-z0-9._-]+")
 DEFAULT_BUDGET_CHARS = 4500
 INTERESTING_FIELDS = [
     "reason",
@@ -42,16 +42,31 @@ INTERESTING_FIELDS = [
     "selectedModel",
     "requestedModel",
     "effectiveModel",
+    "adaptiveSchedule",
+    "adaptiveCadencePhase",
+    "configuredCadenceMillis",
+    "cadenceMillis",
     "remoteStatus",
     "message",
     "stableTranscriptChars",
     "deltaChars",
     "fullDeltaChars",
+    "minDeltaChars",
     "firstTokenSeen",
     "fallbackAttempted",
     "fallbackResult",
     "lastSentTranscriptChars",
     "lastSentTranscriptAdvanced",
+    "retryAfterSeconds",
+    "rateLimitLimitRequests",
+    "rateLimitRemainingRequests",
+    "rateLimitResetRequests",
+    "rateLimitLimitTokens",
+    "rateLimitRemainingTokens",
+    "rateLimitResetTokens",
+    "cooldownDurationMs",
+    "cooldownRemainingMs",
+    "cooldownSource",
 ]
 
 
@@ -166,6 +181,39 @@ def counter_summary(counter: collections.Counter[str], limit: int = 5) -> str:
     return ", ".join(items)
 
 
+def adaptive_phase_summary(events: Iterable[TraceEvent]) -> list[str]:
+    phases = ["warmup", "middle", "sustained"]
+    rows: list[str] = []
+    for phase in phases:
+        phase_events = [event for event in events if event.fields.get("adaptiveCadencePhase") == phase]
+        if not phase_events:
+            continue
+        requests = sum(1 for event in phase_events if event.label in {"groq_request_started", "openrouter_request_started"})
+        committed = sum(1 for event in phase_events if event.label == "summary_response_committed")
+        unchanged = sum(1 for event in phase_events if event.label == "summary_response_valid_unchanged")
+        failures = collections.Counter(
+            event.fields.get("remoteStatus", "missing")
+            for event in phase_events
+            if event.label == "summary_response_failed"
+        )
+        skips = collections.Counter(
+            event.fields.get("reason", "missing")
+            for event in phase_events
+            if event.label == "summary_attempt_skipped"
+        )
+        parts = [
+            f"{phase}: requests={requests}",
+            f"committed={committed}",
+            f"unchanged={unchanged}",
+        ]
+        if failures:
+            parts.append(f"failures={counter_summary(failures, 3)}")
+        if skips:
+            parts.append(f"skips={counter_summary(skips, 3)}")
+        rows.append(", ".join(parts))
+    return rows
+
+
 def first_event(events: Iterable[TraceEvent], label: str) -> TraceEvent | None:
     return next((event for event in events if event.label == label), None)
 
@@ -221,6 +269,20 @@ def root_cause(events: list[TraceEvent], persisted_text: str) -> tuple[str, list
         evidence.append(f"{len(commits)} committed summary event(s) were found.")
         if first_drafts:
             evidence.append(f"{len(first_drafts)} first streaming draft event(s) were found.")
+        rate_limited = [event for event in failures if event.fields.get("remoteStatus") == "RateLimited"]
+        if rate_limited:
+            evidence.append(f"{len(rate_limited)} later rate-limited summary failure(s) were found.")
+            latest_rate_limit = rate_limited[-1]
+            for key in [
+                "retryAfterSeconds",
+                "rateLimitRemainingRequests",
+                "rateLimitResetRequests",
+                "rateLimitRemainingTokens",
+                "rateLimitResetTokens",
+            ]:
+                value = latest_rate_limit.fields.get(key)
+                if value and value != "none":
+                    evidence.append(f"Latest rate limit {key}: {value}.")
         return summary, evidence
 
     if skips.get("remote_summaries_disabled", 0):
@@ -252,8 +314,23 @@ def root_cause(events: list[TraceEvent], persisted_text: str) -> tuple[str, list
 
     if failures:
         status_counts = collections.Counter(event.fields.get("remoteStatus", "missing") for event in failures)
-        summary = "Remote summary requests failed before English context could be committed."
+        if status_counts.get("RateLimited", 0):
+            summary = "Remote summary requests hit provider rate limits before English context could be committed."
+        else:
+            summary = "Remote summary requests failed before English context could be committed."
         evidence.append("Failure statuses: " + ", ".join(f"{key}={value}" for key, value in status_counts.items()))
+        latest_rate_limit = next((event for event in reversed(failures) if event.fields.get("remoteStatus") == "RateLimited"), None)
+        if latest_rate_limit:
+            for key in [
+                "retryAfterSeconds",
+                "rateLimitRemainingRequests",
+                "rateLimitResetRequests",
+                "rateLimitRemainingTokens",
+                "rateLimitResetTokens",
+            ]:
+                value = latest_rate_limit.fields.get(key)
+                if value and value != "none":
+                    evidence.append(f"Latest rate limit {key}: {value}.")
         if no_persisted:
             evidence.append("No persisted English summaries were recorded.")
         return summary, evidence
@@ -288,10 +365,12 @@ def brief_key_events(events: list[TraceEvent], limit: int) -> list[TraceEvent]:
         "start_recording_requested",
         "summary_scheduler_started",
         "summary_prompt_prepared",
+        "groq_request_started",
         "openrouter_request_started",
         "openrouter_fallback_retry_started",
         "openrouter_first_streaming_draft",
         "summary_response_failed",
+        "summary_rate_limit_cooldown_started",
         "summary_response_committed",
         "summary_response_valid_unchanged",
     ]:
@@ -309,7 +388,7 @@ def brief_key_events(events: list[TraceEvent], limit: int) -> list[TraceEvent]:
         seen_failures.add(identity)
         selected.append(event)
 
-    for reason in ["remote_summaries_disabled", "missing_openrouter_key", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_unchanged_since_last_sent"]:
+    for reason in ["remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_unchanged_since_last_sent", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown"]:
         event = next(
             (
                 item
@@ -341,19 +420,21 @@ def full_key_events(events: list[TraceEvent], limit: int) -> list[TraceEvent]:
         "start_recording_requested",
         "summary_scheduler_started",
         "summary_prompt_prepared",
+        "groq_request_started",
         "openrouter_request_started",
         "openrouter_fallback_retry_started",
         "openrouter_first_streaming_draft",
         "summary_response_committed",
         "summary_response_valid_unchanged",
         "summary_response_failed",
+        "summary_rate_limit_cooldown_started",
     }
     selected = [event for event in events if event.label in labels]
     selected.extend(
         event
         for event in events
         if event.label == "summary_attempt_skipped"
-        and event.fields.get("reason") in {"remote_summaries_disabled", "missing_openrouter_key", "missing_openrouter_model", "stable_transcript_empty"}
+        and event.fields.get("reason") in {"remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown"}
     )
     deduped: list[TraceEvent] = []
     seen: set[tuple[str, str, str]] = set()
@@ -402,6 +483,7 @@ def make_report(path: pathlib.Path, max_events: int, full: bool, budget_chars: i
         for event in events
         if event.label == "summary_response_failed"
     )
+    phase_rows = adaptive_phase_summary(events)
 
     report: list[str] = []
     report.append("# Listener Trace Brief")
@@ -457,6 +539,11 @@ def make_report(path: pathlib.Path, max_events: int, full: bool, budget_chars: i
         report.append("- Failure statuses: " + counter_summary(failure_status_counts, 4))
     if failure_messages:
         report.append("- Failure messages: " + " | ".join(f"{value}x {truncate(key, 90)}" for key, value in failure_messages.most_common(2 if not full else 4)))
+    if phase_rows:
+        report.append("")
+        report.append("## Adaptive Phases")
+        report.append("")
+        report.extend(f"- {row}" for row in phase_rows)
     report.append("")
     report.append("## Evidence Lines")
     report.append("")

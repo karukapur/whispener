@@ -12,9 +12,9 @@ const val OPENROUTER_FREE_ROUTER_MODEL_ID = "openrouter/free"
 const val DEFAULT_OPENROUTER_MODEL_ID = OPENROUTER_FREE_ROUTER_MODEL_ID
 const val GROQ_GPT_OSS_20B_REMOTE_MODEL_ID = "groq/openai/gpt-oss-20b"
 const val DEFAULT_REMOTE_MODEL_ID = GROQ_GPT_OSS_20B_REMOTE_MODEL_ID
-const val GROQ_MIN_SUMMARY_CADENCE_MILLIS = 2_000
 const val MIN_SUMMARY_CADENCE_MILLIS = 500
 const val MAX_SUMMARY_CADENCE_MILLIS = 10_000
+const val GROQ_MIN_SUMMARY_CADENCE_MILLIS = MIN_SUMMARY_CADENCE_MILLIS
 const val SUMMARY_CADENCE_STEP_MILLIS = 500
 const val DEFAULT_SUMMARY_CADENCE_MILLIS = 5_000
 
@@ -67,18 +67,19 @@ class UserPreferences(private val context: Context) {
 
     val values: Flow<ListenerPreferences> = context.listenerDataStore.data.map { prefs ->
         val remoteUserSet = prefs[Keys.remoteUserSet] ?: false
+        val selectedModel = prefs[Keys.model] ?: DEFAULT_REMOTE_MODEL_ID
         ListenerPreferences(
             onboardingComplete = prefs[Keys.onboarding] ?: false,
             remoteEnabled = if (remoteUserSet) prefs[Keys.remote] ?: true else true,
             retentionDays = prefs[Keys.retention] ?: 30,
-            selectedModel = prefs[Keys.model] ?: DEFAULT_REMOTE_MODEL_ID,
+            selectedModel = selectedModel,
             selectedLocalModelId = prefs[Keys.localModel],
             transcriptionEngine = TranscriptionEngine.fromId(prefs[Keys.transcriptionEngine]),
             whisperWorkProfile = WhisperWorkProfile.fromId(prefs[Keys.whisperWorkProfile]),
             summaryCadenceMillis = cadenceMillisPreference(
                 storedMillis = prefs[Keys.cadenceMillis],
                 legacySeconds = prefs[Keys.cadenceSeconds],
-            ),
+            ).coerceAtLeast(minimumSummaryCadenceMillis(selectedModel)).snapSummaryCadenceMillis(),
         )
     }
 

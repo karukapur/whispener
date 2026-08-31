@@ -91,6 +91,13 @@ private data class SummaryRemoteAttempt(
     val fallbackResult: String,
 )
 
+internal data class SummaryRateLimitCooldown(
+    val modelId: String,
+    val untilMillis: Long,
+    val durationMillis: Long,
+    val source: String,
+)
+
 private data class LocalState(
     val runtime: ListenerRuntimeState,
     val preferences: ListenerPreferences,
@@ -121,6 +128,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
     private var summaryJob: Job? = null
     private var lastSentTranscript = ""
     private val summaryGate = SummaryRequestGate()
+    private val summaryRateLimitBackoff = SummaryRateLimitBackoff()
     private val summaryDebugTrace = SummaryDebugTrace(File(app.filesDir, "summary-debug-traces"))
 
     private val local = combine(
@@ -191,14 +199,19 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                         return@collectLatest
                     }
                     lastSentTranscript = ""
+                    summaryRateLimitBackoff.clear()
                     streamingContext.value = StreamingContextState()
                     val preferences = app.preferences.values.first()
-                    summaryDiagnostics.value = SummaryDiagnostics(phase = "Waiting for finalized transcript", cadenceMillis = preferences.summaryCadenceMillis)
+                    summaryDiagnostics.value = SummaryDiagnostics(
+                        phase = "Waiting for finalized transcript",
+                        cadenceMillis = adaptiveSummaryCadenceMillis(ListeningRuntime.state.value.elapsedSeconds),
+                    )
                     summaryDebugTrace.append(
                         sessionId = ListeningRuntime.state.value.sessionId,
                         label = "summary_scheduler_started",
                         fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
                             "firstSummaryDelayMs" to FIRST_SUMMARY_DELAY_MS.toString(),
+                            "adaptiveSchedule" to ADAPTIVE_SUMMARY_CADENCE_TRACE_LABEL,
                             "apiKeyPresent" to remoteApiKeyPresent(preferences.selectedModel).yesNo(),
                         ),
                     )
@@ -206,7 +219,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                     launch { sendSummaryIfNeeded(app.preferences.values.first()) }
                     while (currentCoroutineContext().isActive) {
                         val preferences = app.preferences.values.first()
-                        delay(preferences.summaryCadenceMillis.toLong())
+                        delay(adaptiveSummaryCadenceMillis(ListeningRuntime.state.value.elapsedSeconds).toLong())
                         launch { sendSummaryIfNeeded(preferences) }
                     }
                 }
@@ -453,8 +466,9 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun sendSummaryIfNeeded(preferences: ListenerPreferences) {
         val runtime = ListeningRuntime.state.value
+        val cadenceMillis = adaptiveSummaryCadenceMillis(runtime.elapsedSeconds)
         if (!summaryGate.tryStart()) {
-            summaryDiagnostics.updateTrace("Summary in flight", preferences.summaryCadenceMillis)
+            summaryDiagnostics.updateTrace("Summary in flight", cadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_tick_coalesced_in_flight",
@@ -471,6 +485,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
 
     private suspend fun sendSummaryIfNeededLocked(preferences: ListenerPreferences) {
         val runtime = ListeningRuntime.state.value
+        val cadenceMillis = adaptiveSummaryCadenceMillis(runtime.elapsedSeconds)
         val requestedModel = preferences.selectedModel
         val apiKeyPresent = remoteApiKeyPresent(requestedModel)
         summaryDebugTrace.append(
@@ -485,7 +500,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             ),
         )
         if (!preferences.remoteEnabled) {
-            summaryDiagnostics.updateTrace("Remote summaries disabled", preferences.summaryCadenceMillis)
+            summaryDiagnostics.updateTrace("Remote summaries disabled", cadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -494,7 +509,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             return
         }
         val resolvedModel = requestedModel ?: run {
-            summaryDiagnostics.updateTrace("Waiting for selected remote model", preferences.summaryCadenceMillis)
+            summaryDiagnostics.updateTrace("Waiting for selected remote model", cadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -505,7 +520,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         val selectedProviderKey = remoteApiKey(resolvedModel)
         if (selectedProviderKey == null) {
             val provider = remoteProviderName(resolvedModel)
-            summaryDiagnostics.updateTrace("Waiting for $provider key", preferences.summaryCadenceMillis)
+            summaryDiagnostics.updateTrace("Waiting for $provider key", cadenceMillis)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -518,7 +533,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         val fallbackOpenRouterKey = app.keyStore.read()
         val transcript = runtime.finalizedTranscriptForSummary()
         if (transcript.isBlank()) {
-            summaryDiagnostics.updateTrace("Waiting for finalized transcript", preferences.summaryCadenceMillis, resolvedModel, transcriptChars = 0, deltaChars = 0)
+            summaryDiagnostics.updateTrace("Waiting for finalized transcript", cadenceMillis, resolvedModel, transcriptChars = 0, deltaChars = 0)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
@@ -527,12 +542,64 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             return
         }
         if (transcript == lastSentTranscript) {
-            summaryDiagnostics.updateTrace("No new finalized transcript", preferences.summaryCadenceMillis, resolvedModel, transcriptChars = transcript.length, deltaChars = 0)
+            summaryDiagnostics.updateTrace("No new finalized transcript", cadenceMillis, resolvedModel, transcriptChars = transcript.length, deltaChars = 0)
             summaryDebugTrace.append(
                 sessionId = runtime.sessionId,
                 label = "summary_attempt_skipped",
                 fields = summaryTraceFields(preferences, runtime) + mapOf(
                     "reason" to "stable_transcript_unchanged_since_last_sent",
+                    "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
+                ),
+            )
+            return
+        }
+        val newTranscriptDelta = transcript.deltaSince(lastSentTranscript)
+        if (newTranscriptDelta.length < MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS) {
+            summaryDiagnostics.updateTrace(
+                phase = "Waiting for more finalized transcript",
+                cadenceMillis = cadenceMillis,
+                modelId = resolvedModel,
+                transcriptChars = transcript.length,
+                deltaChars = newTranscriptDelta.length,
+            )
+            summaryDebugTrace.append(
+                sessionId = runtime.sessionId,
+                label = "summary_attempt_skipped",
+                fields = summaryTraceFields(preferences, runtime) + mapOf(
+                    "reason" to "stable_transcript_delta_below_minimum",
+                    "minDeltaChars" to MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS.toString(),
+                    "deltaChars" to newTranscriptDelta.length.toString(),
+                    "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
+                ),
+            )
+            return
+        }
+        summaryRateLimitBackoff.cooldownFor(resolvedModel)?.let { cooldown ->
+            val now = System.currentTimeMillis()
+            val remainingMs = (cooldown.untilMillis - now).coerceAtLeast(0L)
+            summaryDiagnostics.update { current ->
+                current.copy(
+                    phase = "${remoteProviderName(resolvedModel)} rate limit cooldown",
+                    modelId = resolvedModel,
+                    cadenceMillis = cadenceMillis,
+                    transcriptChars = transcript.length,
+                    deltaChars = transcript.deltaSince(lastSentTranscript).length,
+                    finalAtMillis = now,
+                    error = remoteMessage.value ?: "${remoteProviderName(resolvedModel)} is rate limited; retrying after cooldown.",
+                    events = current.events.plus(
+                        SummaryTraceEvent(now, "Rate limit cooldown: ${remainingMs}ms remaining")
+                    ).takeLast(MAX_SUMMARY_EVENTS),
+                )
+            }
+            summaryDebugTrace.append(
+                sessionId = runtime.sessionId,
+                label = "summary_attempt_skipped",
+                fields = summaryTraceFields(preferences, runtime) + mapOf(
+                    "reason" to "remote_rate_limit_cooldown",
+                    "cooldownModel" to cooldown.modelId,
+                    "cooldownRemainingMs" to remainingMs.toString(),
+                    "cooldownUntilMillis" to cooldown.untilMillis.toString(),
+                    "cooldownSource" to cooldown.source,
                     "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
                 ),
             )
@@ -557,7 +624,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         summaryDiagnostics.value = SummaryDiagnostics(
             phase = "Transcript ready",
             modelId = resolvedModel,
-            cadenceMillis = preferences.summaryCadenceMillis,
+            cadenceMillis = cadenceMillis,
             transcriptChars = transcript.length,
             deltaChars = newText.length,
             transcriptReadyAtMillis = transcriptReadyAt,
@@ -700,6 +767,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 streamingContext.value = commit.state
                 remoteStatus.value = RemoteStatus.Ready
                 remoteMessage.value = null
+                summaryRateLimitBackoff.clear(remoteAttempt.effectiveModel)
                 lastSentTranscript = transcript
                 if (remoteAttempt.fallbackAttempted) app.preferences.setSelectedModel(OPENROUTER_FREE_ROUTER_MODEL_ID)
                 if (commit.changed) runtime.sessionId?.let { app.sessions.appendSummary(it, result.value) }
@@ -758,6 +826,20 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 } else {
                     remoteStatus.value = result.status
                     remoteMessage.value = result.message
+                    if (result.status == RemoteStatus.RateLimited) {
+                        val cooldown = summaryRateLimitBackoff.recordFailure(remoteAttempt.effectiveModel, result.diagnostics, failedAt)
+                        summaryDebugTrace.append(
+                            sessionId = runtime.sessionId,
+                            label = "summary_rate_limit_cooldown_started",
+                            fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
+                                "requestedModel" to resolvedModel,
+                                "effectiveModel" to remoteAttempt.effectiveModel,
+                                "cooldownDurationMs" to cooldown.durationMillis.toString(),
+                                "cooldownUntilMillis" to cooldown.untilMillis.toString(),
+                                "cooldownSource" to cooldown.source,
+                            ),
+                        )
+                    }
                 }
             }
         }
@@ -890,10 +972,117 @@ internal fun RemoteFailureDiagnostics?.toSummaryTraceFields(): Map<String, Strin
         "sseErrorSeen" to ((diagnostics?.sseErrorType != null || diagnostics?.sseErrorMessage != null).yesNo()),
         "sseErrorType" to (diagnostics?.sseErrorType ?: "none"),
         "sseErrorMessage" to (diagnostics?.sseErrorMessage ?: "none"),
+        "retryAfterSeconds" to (diagnostics?.retryAfterSeconds ?: "none"),
+        "rateLimitLimitRequests" to (diagnostics?.rateLimitLimitRequests ?: "none"),
+        "rateLimitRemainingRequests" to (diagnostics?.rateLimitRemainingRequests ?: "none"),
+        "rateLimitResetRequests" to (diagnostics?.rateLimitResetRequests ?: "none"),
+        "rateLimitLimitTokens" to (diagnostics?.rateLimitLimitTokens ?: "none"),
+        "rateLimitRemainingTokens" to (diagnostics?.rateLimitRemainingTokens ?: "none"),
+        "rateLimitResetTokens" to (diagnostics?.rateLimitResetTokens ?: "none"),
         "responseHash" to (diagnostics?.responseHash ?: "none"),
         "safeResponseExcerpt" to (diagnostics?.safeResponseExcerpt ?: "none"),
     )
 }
+
+internal class SummaryRateLimitBackoff(
+    private val clock: () -> Long = System::currentTimeMillis,
+) {
+    private val cooldowns = mutableMapOf<String, SummaryRateLimitCooldown>()
+
+    fun cooldownFor(modelId: String): SummaryRateLimitCooldown? {
+        val cooldown = cooldowns[modelId] ?: return null
+        if (cooldown.untilMillis <= clock()) {
+            cooldowns.remove(modelId)
+            return null
+        }
+        return cooldown
+    }
+
+    fun recordFailure(
+        modelId: String,
+        diagnostics: RemoteFailureDiagnostics?,
+        atMillis: Long = clock(),
+    ): SummaryRateLimitCooldown {
+        val decision = rateLimitCooldownDecision(diagnostics)
+        val cooldown = SummaryRateLimitCooldown(
+            modelId = modelId,
+            untilMillis = atMillis + decision.durationMillis,
+            durationMillis = decision.durationMillis,
+            source = decision.source,
+        )
+        cooldowns[modelId] = cooldown
+        return cooldown
+    }
+
+    fun clear(modelId: String? = null) {
+        if (modelId == null) {
+            cooldowns.clear()
+        } else {
+            cooldowns.remove(modelId)
+        }
+    }
+}
+
+internal data class RateLimitCooldownDecision(
+    val durationMillis: Long,
+    val source: String,
+)
+
+internal fun rateLimitCooldownDecision(diagnostics: RemoteFailureDiagnostics?): RateLimitCooldownDecision {
+    val retryAfterMs = diagnostics?.retryAfterSeconds.parseRateLimitDurationMillis()
+    if (retryAfterMs != null) {
+        return RateLimitCooldownDecision(
+            durationMillis = retryAfterMs.clampRateLimitCooldown(),
+            source = "retry-after",
+        )
+    }
+    val requestResetMs = diagnostics?.rateLimitResetRequests
+        .takeIf { diagnostics?.rateLimitRemainingRequests.isZeroRateLimitRemaining() }
+        .parseRateLimitDurationMillis()
+    val tokenResetMs = diagnostics?.rateLimitResetTokens
+        .takeIf { diagnostics?.rateLimitRemainingTokens.isZeroRateLimitRemaining() }
+        .parseRateLimitDurationMillis()
+    val resetMs = listOfNotNull(requestResetMs, tokenResetMs).maxOrNull()
+    if (resetMs != null) {
+        return RateLimitCooldownDecision(
+            durationMillis = resetMs.clampRateLimitCooldown(),
+            source = when {
+                requestResetMs != null && tokenResetMs != null -> "ratelimit-reset-requests-and-tokens"
+                requestResetMs != null -> "ratelimit-reset-requests"
+                else -> "ratelimit-reset-tokens"
+            },
+        )
+    }
+    return RateLimitCooldownDecision(
+        durationMillis = DEFAULT_RATE_LIMIT_COOLDOWN_MS,
+        source = "default",
+    )
+}
+
+internal fun String?.parseRateLimitDurationMillis(): Long? {
+    val value = this?.trim()?.takeIf(String::isNotBlank) ?: return null
+    value.toDoubleOrNull()?.let { return (it * 1_000).toLong().coerceAtLeast(0L) }
+    val regex = Regex("""(\d+(?:\.\d+)?)(ms|s|m|h)""", RegexOption.IGNORE_CASE)
+    val matches = regex.findAll(value).toList()
+    if (matches.isEmpty()) return null
+    val millis = matches.sumOf { match ->
+        val amount = match.groupValues[1].toDoubleOrNull() ?: 0.0
+        when (match.groupValues[2].lowercase(Locale.US)) {
+            "ms" -> amount
+            "s" -> amount * 1_000
+            "m" -> amount * 60_000
+            "h" -> amount * 3_600_000
+            else -> 0.0
+        }
+    }
+    return millis.toLong().coerceAtLeast(0L)
+}
+
+private fun String?.isZeroRateLimitRemaining(): Boolean =
+    this?.trim()?.toDoubleOrNull()?.let { it <= 0.0 } == true
+
+private fun Long.clampRateLimitCooldown(): Long =
+    coerceIn(MIN_RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS)
 
 internal class SummaryRequestGate {
     private val inFlight = AtomicBoolean(false)
@@ -985,9 +1174,10 @@ internal fun buildDetailedSummaryTrace(
     appendLine()
     appendLine("How to read this")
     appendLine("- If the Chinese transcript is good but English is missing, look for summary_attempt_skipped or summary_response_failed lines.")
-    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_groq_key, missing_remote_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent.")
+    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_groq_key, missing_remote_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent, stable_transcript_delta_below_minimum, remote_rate_limit_cooldown.")
+    appendLine("- cadenceMillis is the active adaptive cadence; configuredCadenceMillis is the stored preference for comparison.")
     appendLine("- InvalidResponse means the selected remote provider replied, but the app could not parse valid JSON, so the previous context was kept and lastSentTranscript was not advanced.")
-    appendLine("- RateLimited, Offline, TimedOut, InvalidKey, and ModelUnavailable are remote/API states; transcript capture can still be perfect while summaries fail.")
+    appendLine("- RateLimited lines include safe request/token limit headers when the provider returns them. A following remote_rate_limit_cooldown skip means transcript capture continued while remote summary retries paused.")
     appendLine()
     appendLine("Current diagnostics snapshot")
     appendLine(diagnostics.toDetailedTraceSnapshot())
@@ -1004,8 +1194,9 @@ internal fun buildTraceLine(timeMillis: Long, label: String, fields: Map<String,
     return "${formatTraceTimestamp(timeMillis)} $label $details".trimEnd()
 }
 
-internal fun summaryTraceFields(preferences: ListenerPreferences, runtime: ListenerRuntimeState): Map<String, String> =
-    mapOf(
+internal fun summaryTraceFields(preferences: ListenerPreferences, runtime: ListenerRuntimeState): Map<String, String> {
+    val adaptiveCadenceMillis = adaptiveSummaryCadenceMillis(runtime.elapsedSeconds)
+    return mapOf(
         "sessionId" to (runtime.sessionId?.toString() ?: "none"),
         "recording" to runtime.recording.yesNo(),
         "stopping" to runtime.stopping.yesNo(),
@@ -1014,8 +1205,10 @@ internal fun summaryTraceFields(preferences: ListenerPreferences, runtime: Liste
         "activeModelId" to (runtime.activeModelId ?: "none"),
         "remoteEnabled" to preferences.remoteEnabled.yesNo(),
         "selectedRemoteModel" to (preferences.selectedModel ?: "none"),
-        "cadenceMillis" to preferences.summaryCadenceMillis.toString(),
-        "cadenceSessionSeconds" to preferences.summaryCadenceMillis.toSummaryIntervalSeconds().toString(),
+        "cadenceMillis" to adaptiveCadenceMillis.toString(),
+        "cadenceSessionSeconds" to adaptiveCadenceMillis.toSummaryIntervalSeconds().toString(),
+        "configuredCadenceMillis" to preferences.summaryCadenceMillis.toString(),
+        "adaptiveCadencePhase" to adaptiveSummaryCadencePhase(runtime.elapsedSeconds),
         "stableTranscriptChars" to runtime.stableTranscript.length.toString(),
         "provisionalTranscriptChars" to runtime.provisionalTranscript.length.toString(),
         "elapsedSeconds" to runtime.elapsedSeconds.toString(),
@@ -1023,6 +1216,7 @@ internal fun summaryTraceFields(preferences: ListenerPreferences, runtime: Liste
         "recoverableError" to (runtime.recoverableError ?: "none"),
         "transcriptionStatus" to (runtime.transcriptionStatus ?: "none"),
     )
+}
 
 internal fun SummaryDiagnostics.toDetailedTraceSnapshot(): String =
     buildString {
@@ -1060,13 +1254,35 @@ private fun MutableStateFlow<SummaryDiagnostics>.updateTrace(
     }
 }
 
+internal fun adaptiveSummaryCadenceMillis(elapsedSeconds: Long): Int = when {
+    elapsedSeconds < ADAPTIVE_SUMMARY_WARMUP_SECONDS -> ADAPTIVE_SUMMARY_WARMUP_CADENCE_MILLIS
+    elapsedSeconds < ADAPTIVE_SUMMARY_MIDDLE_SECONDS -> ADAPTIVE_SUMMARY_MIDDLE_CADENCE_MILLIS
+    else -> ADAPTIVE_SUMMARY_SUSTAINED_CADENCE_MILLIS
+}
+
+internal fun adaptiveSummaryCadencePhase(elapsedSeconds: Long): String = when {
+    elapsedSeconds < ADAPTIVE_SUMMARY_WARMUP_SECONDS -> "warmup"
+    elapsedSeconds < ADAPTIVE_SUMMARY_MIDDLE_SECONDS -> "middle"
+    else -> "sustained"
+}
+
 private const val FIRST_SUMMARY_DELAY_MS = 2_000L
 private const val MAX_CONTEXT_HISTORY = 30
 private const val MAX_SUMMARY_EVENTS = 6
 private const val PREVIOUS_SUMMARY_PROMPT_CHARS = 2_000
 private const val CHINESE_DELTA_PROMPT_CHARS = 2_000
 private const val CHINESE_CONTINUITY_TAIL_CHARS = 800
+internal const val MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS = 3
+internal const val ADAPTIVE_SUMMARY_WARMUP_CADENCE_MILLIS = 5_000
+internal const val ADAPTIVE_SUMMARY_MIDDLE_CADENCE_MILLIS = 8_000
+internal const val ADAPTIVE_SUMMARY_SUSTAINED_CADENCE_MILLIS = 10_000
+private const val ADAPTIVE_SUMMARY_WARMUP_SECONDS = 60L
+private const val ADAPTIVE_SUMMARY_MIDDLE_SECONDS = 120L
+private const val ADAPTIVE_SUMMARY_CADENCE_TRACE_LABEL = "warmup_5s_until_60s_middle_8s_until_120s_sustained_10s"
 private const val MAX_LOW_LATENCY_REMOTE_MODELS = 5
+private const val MIN_RATE_LIMIT_COOLDOWN_MS = 5_000L
+private const val DEFAULT_RATE_LIMIT_COOLDOWN_MS = 60_000L
+private const val MAX_RATE_LIMIT_COOLDOWN_MS = 60 * 60_000L
 private const val SUMMARY_LOG_TAG = "ListenerSummary"
 
 private fun Boolean.yesNo(): String = if (this) "yes" else "no"

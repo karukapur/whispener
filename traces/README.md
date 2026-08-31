@@ -15,6 +15,11 @@ By default the script:
 - Keeps output around a small character budget.
 - Prioritizes causal signals over repeated runtime noise.
 
+Runtime trace fields use `cadenceMillis` for the active adaptive summary
+cadence. `configuredCadenceMillis` preserves the stored user preference for
+comparison, and `adaptiveCadencePhase` reports `warmup`, `middle`, or
+`sustained`.
+
 ## Useful Options
 
 ```sh
@@ -24,6 +29,20 @@ python3 traces/summarize_trace_for_llm.py --full --max-events 24 --budget-chars 
 ```
 
 Use the brief output first. Use `--full` only when the brief points to a timing, parser, or UI-state ambiguity that needs more surrounding evidence.
+
+## Rate Limit Traces
+
+`RateLimited` failures include safe provider headers when Groq or OpenRouter returns them:
+
+- `retryAfterSeconds`
+- `rateLimitRemainingRequests` / `rateLimitResetRequests`
+- `rateLimitRemainingTokens` / `rateLimitResetTokens`
+
+If the app pauses retries after one of these failures, the runtime log will show `summary_rate_limit_cooldown_started`, followed by `summary_attempt_skipped reason=remote_rate_limit_cooldown` while local transcript capture continues.
+
+## Delta Guard Traces
+
+`summary_attempt_skipped reason=stable_transcript_delta_below_minimum` means remote summaries were otherwise ready, but fewer than three new finalized Chinese characters were pending. `lastSentTranscript` is not advanced on this skip, so the tiny delta accumulates into the next eligible request.
 
 ## Agent Note
 

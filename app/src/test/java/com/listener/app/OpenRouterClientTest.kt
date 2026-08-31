@@ -127,9 +127,30 @@ class OpenRouterClientTest {
     }
 
     @Test fun rateLimitIsTypedAndNonThrowing() = runTest {
-        server.enqueue(MockResponse().setResponseCode(429))
+        server.enqueue(
+            MockResponse()
+                .setResponseCode(429)
+                .setHeader("retry-after", "12")
+                .setHeader("x-ratelimit-limit-requests", "1000")
+                .setHeader("x-ratelimit-remaining-requests", "0")
+                .setHeader("x-ratelimit-reset-requests", "2m59.56s")
+                .setHeader("x-ratelimit-limit-tokens", "8000")
+                .setHeader("x-ratelimit-remaining-tokens", "42")
+                .setHeader("x-ratelimit-reset-tokens", "7.66s")
+                .setBody("""{"error":{"message":"Rate limit reached"}}"""),
+        )
         val result = client.summarize("secret", "free/model", "old", "中文", "中文") as RemoteResult.Failure
         assertEquals(RemoteStatus.RateLimited, result.status)
+        assertEquals("OpenRouter rate limit reached; waiting before retrying.", result.message)
+        assertEquals("12", result.diagnostics?.retryAfterSeconds)
+        assertEquals("1000", result.diagnostics?.rateLimitLimitRequests)
+        assertEquals("0", result.diagnostics?.rateLimitRemainingRequests)
+        assertEquals("2m59.56s", result.diagnostics?.rateLimitResetRequests)
+        assertEquals("8000", result.diagnostics?.rateLimitLimitTokens)
+        assertEquals("42", result.diagnostics?.rateLimitRemainingTokens)
+        assertEquals("7.66s", result.diagnostics?.rateLimitResetTokens)
+        assertNotNull(result.diagnostics?.responseHash)
+        assertTrue(result.diagnostics?.safeResponseExcerpt.orEmpty().contains("Rate limit reached"))
     }
 
     @Test fun malformedSummaryIsRejected() = runTest {

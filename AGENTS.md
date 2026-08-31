@@ -25,7 +25,7 @@ The local model selection and remote summary selection are intentionally separat
 1. `ListenerViewModel.startRecording` records the current preferences and starts the selected local speech service.
 2. `ListeningService` or `PlatformSpeechService` updates `ListeningRuntime.state` with stable/provisional Chinese transcript text.
 3. The summary scheduler wakes on the configured cadence and calls `sendSummaryIfNeeded`.
-4. Summary requests require all of these: remote summaries enabled, the selected provider's key present, a selected remote model, and nonblank finalized Chinese text.
+4. Summary requests require all of these: remote summaries enabled, the selected provider's key present, a selected remote model, and at least three new finalized Chinese characters.
 5. Successful remote output is parsed into `ListeningContext`, committed to `StreamingContextState`, and persisted to the current session.
 6. Failed remote output must not stop recording and must not mark Chinese text as successfully summarized.
 
@@ -49,7 +49,8 @@ OpenRouter free-model availability changes over time. Do not hard-code a specifi
 - Groq is a separate provider option backed by `openai/gpt-oss-20b`, not an OpenRouter model alias.
 - Debug builds may read `GROQ_API_KEY` from Gradle, the environment, or `local.properties`; release builds keep the field empty.
 - Use strict non-streaming structured output with low reasoning effort because Groq does not combine streaming with structured output.
-- Selecting Groq raises any lower stored summary cadence to 2 seconds and constrains the slider to 2–10 seconds. Other providers retain 500 ms–10 s.
+- Remote summaries currently use the same adaptive cadence trial for every remote model: 5 seconds during the first recording minute, 8 seconds during the second minute, and 10 seconds afterward. This schedule is based on Groq cadence experiments; do not treat it as OpenRouter-specific evidence until OpenRouter has been remeasured.
+- Groq and OpenRouter `RateLimited` failures should start a header-driven cooldown before retrying the same remote model. Keep local transcription running and leave `lastSentTranscript` unchanged during cooldown.
 - If Groq reports model unavailability and an OpenRouter key exists, the existing one-time `openrouter/free` fallback may run. Other Groq failures keep local transcription active and leave `lastSentTranscript` unchanged.
 
 ## Trace Debugging
@@ -73,7 +74,9 @@ Important trace fields:
 - `openrouter_first_streaming_draft`: first parseable streamed English context.
 - `summary_response_committed`: English context was accepted and persisted.
 - `summary_response_failed`: remote/API/parsing failure; local transcription may still be healthy.
+- `summary_rate_limit_cooldown_started`: a `RateLimited` response paused retries for the same remote model.
 - `responseChars`, `streamDeltaChars`, `doneSeen`, `parseStage`, `finishReason`, `sseErrorSeen`, `responseHash`, `safeResponseExcerpt`: bounded failure diagnostics only; excerpts are redacted/truncated and full model output is not logged.
+- `retryAfterSeconds`, `rateLimitRemainingRequests`, `rateLimitResetRequests`, `rateLimitRemainingTokens`, `rateLimitResetTokens`: safe provider rate-limit headers when returned.
 
 For the common "Chinese works, English missing" report, classify the trace before coding:
 
@@ -81,8 +84,10 @@ For the common "Chinese works, English missing" report, classify the trace befor
 - `missing_openrouter_key`: credential issue.
 - `missing_groq_key`: the Groq option is selected but the debug build has no Groq key.
 - `missing_remote_model`: remote model selection issue.
-- `stable_transcript_empty`: local transcript has not finalized enough text.
+- `stable_transcript_empty`: local transcript has not finalized any text.
 - `stable_transcript_unchanged_since_last_sent`: no new finalized Chinese since the last valid summary.
+- `stable_transcript_delta_below_minimum`: fewer than three new finalized Chinese characters are pending; they should accumulate and be sent once the guard is met.
+- `remote_rate_limit_cooldown`: previous `RateLimited` response is still cooling down; local transcript capture should continue and the unsent finalized Chinese should remain pending.
 - `ModelUnavailable` / `No endpoints found`: remote model endpoint issue; prefer router fallback.
 - `InvalidResponse`: model responded but parser rejected it; use `parseStage`, `[DONE]` state, finish reason, and the safe excerpt/hash to distinguish truncated streams from malformed model content.
 
@@ -128,6 +133,7 @@ Acceptance for English context reliability:
 - An unavailable selected OpenRouter model retries once with `openrouter/free`.
 - Successful fallback produces visible English context and persisted summary rows.
 - Failed fallback leaves local transcription running and leaves `lastSentTranscript` unchanged.
+- Rate-limited remote summaries log provider limit headers when available, pause retries for the cooldown window, and leave `lastSentTranscript` unchanged.
 - The main recording status does not show OpenRouter endpoint errors.
 
 ## Documentation Hygiene

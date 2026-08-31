@@ -31,6 +31,13 @@ data class RemoteFailureDiagnostics(
     val finishReason: String? = null,
     val sseErrorType: String? = null,
     val sseErrorMessage: String? = null,
+    val retryAfterSeconds: String? = null,
+    val rateLimitLimitRequests: String? = null,
+    val rateLimitRemainingRequests: String? = null,
+    val rateLimitResetRequests: String? = null,
+    val rateLimitLimitTokens: String? = null,
+    val rateLimitRemainingTokens: String? = null,
+    val rateLimitResetTokens: String? = null,
     val responseHash: String? = null,
     val safeResponseExcerpt: String? = null,
 )
@@ -144,7 +151,7 @@ class OpenRouterClient(
                 401 -> RemoteResult.Failure(RemoteStatus.InvalidKey, "OpenRouter rejected this API key.")
                 408 -> RemoteResult.Failure(RemoteStatus.TimedOut, "OpenRouter timed out.")
                 404 -> RemoteResult.Failure(RemoteStatus.ModelUnavailable, openRouterError(body) ?: "The selected OpenRouter model is unavailable for this request.")
-                429 -> RemoteResult.Failure(RemoteStatus.RateLimited, "The free OpenRouter quota is currently unavailable.")
+                429 -> rateLimitFailure(body, response.headers)
                 in 200..299 -> try { RemoteResult.Success(parse(body)) } catch (_: Throwable) {
                     RemoteResult.Failure(RemoteStatus.InvalidResponse, "OpenRouter returned a response that could not be used; keeping the last context.")
                 }
@@ -161,7 +168,7 @@ class OpenRouterClient(
 
     private suspend fun executeStreaming(request: Request, onDraft: suspend (ListeningContext) -> Unit): RemoteResult<ListeningContext> = try {
         http.newCall(request).execute().use { response ->
-            if (response.code !in 200..299) return httpFailure(response.code, response.body?.string().orEmpty())
+            if (response.code !in 200..299) return httpFailure(response.code, response.body?.string().orEmpty(), response.headers)
             val source = response.body?.source() ?: return invalidResponseFailure(
                 response = "",
                 streamDeltaChars = 0,
@@ -239,7 +246,7 @@ class OpenRouterClient(
     private fun executeNonStreaming(request: Request): RemoteResult<ListeningContext> = try {
         http.newCall(request).execute().use { response ->
             val body = response.body?.string().orEmpty()
-            if (response.code !in 200..299) return httpFailure(response.code, body)
+            if (response.code !in 200..299) return httpFailure(response.code, body, response.headers)
             val content = messageContent(body) ?: return invalidResponseFailure(
                 response = body,
                 streamDeltaChars = 0,
@@ -264,13 +271,20 @@ class OpenRouterClient(
         RemoteResult.Failure(RemoteStatus.Offline, "${requestTarget.displayName} is unavailable; local transcription is still active.")
     }
 
-    private fun httpFailure(code: Int, body: String): RemoteResult.Failure = when (code) {
+    private fun httpFailure(code: Int, body: String, headers: Headers): RemoteResult.Failure = when (code) {
         401 -> RemoteResult.Failure(RemoteStatus.InvalidKey, "${requestTarget.displayName} rejected this API key.")
         408 -> RemoteResult.Failure(RemoteStatus.TimedOut, "${requestTarget.displayName} timed out.")
         404 -> RemoteResult.Failure(RemoteStatus.ModelUnavailable, openRouterError(body) ?: "The selected ${requestTarget.displayName} model is unavailable for this request.")
-        429 -> RemoteResult.Failure(RemoteStatus.RateLimited, "The free ${requestTarget.displayName} quota is currently unavailable.")
+        429 -> rateLimitFailure(body, headers)
         else -> RemoteResult.Failure(RemoteStatus.InvalidResponse, "${requestTarget.displayName} returned HTTP $code.")
     }
+
+    private fun rateLimitFailure(body: String, headers: Headers): RemoteResult.Failure =
+        RemoteResult.Failure(
+            status = RemoteStatus.RateLimited,
+            message = "${requestTarget.displayName} rate limit reached; waiting before retrying.",
+            diagnostics = rateLimitDiagnostics(body, headers),
+        )
 
     private fun streamChunk(data: String): StreamChunk = runCatching {
         val choice = Json.parseToJsonElement(data).jsonObject["choices"]?.jsonArray?.firstOrNull()?.jsonObject
@@ -382,6 +396,23 @@ class OpenRouterClient(
             responseHash = response.sha256Hex(),
             safeResponseExcerpt = response.safeResponseExcerpt(),
         )
+
+    private fun rateLimitDiagnostics(body: String, headers: Headers): RemoteFailureDiagnostics =
+        RemoteFailureDiagnostics(
+            responseChars = body.length.takeIf { it > 0 },
+            retryAfterSeconds = headers.safeHeader("retry-after"),
+            rateLimitLimitRequests = headers.safeHeader("x-ratelimit-limit-requests"),
+            rateLimitRemainingRequests = headers.safeHeader("x-ratelimit-remaining-requests"),
+            rateLimitResetRequests = headers.safeHeader("x-ratelimit-reset-requests"),
+            rateLimitLimitTokens = headers.safeHeader("x-ratelimit-limit-tokens"),
+            rateLimitRemainingTokens = headers.safeHeader("x-ratelimit-remaining-tokens"),
+            rateLimitResetTokens = headers.safeHeader("x-ratelimit-reset-tokens"),
+            responseHash = body.takeIf(String::isNotBlank)?.sha256Hex(),
+            safeResponseExcerpt = body.takeIf(String::isNotBlank)?.safeResponseExcerpt(),
+        )
+
+    private fun Headers.safeHeader(name: String): String? =
+        get(name)?.let(SecretRedactor::redact)?.take(SAFE_RESPONSE_EXCERPT_CHARS)?.takeIf(String::isNotBlank)
 
     private fun String.sha256Hex(): String =
         MessageDigest.getInstance("SHA-256")

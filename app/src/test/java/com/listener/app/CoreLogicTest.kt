@@ -87,9 +87,10 @@ class CoreLogicTest {
         assertTrue(state.recent.sumOf(String::length) <= 500); assertEquals(3, state.compact("summary").recent.size)
     }
     @Test fun keysAreRedacted() {
-        val redacted = SecretRedactor.redact("Bearer abc.def sk-or-v1-secret gsk_groq-secret")
+        val redacted = SecretRedactor.redact("Bearer abc.def sk-or-v1-secret gsk_groq-secret org_01secret")
         assertFalse(redacted.contains("secret"))
         assertFalse(redacted.contains("gsk_"))
+        assertFalse(redacted.contains("org_"))
     }
     @Test fun lifecycleStopsFromRecordingAndInterruption() {
         assertEquals(RecordingState.STOPPING, reduce(RecordingState.RECORDING, RecordingEvent.Stop))
@@ -125,6 +126,15 @@ class CoreLogicTest {
         assertEquals(1, 500.toSummaryIntervalSeconds())
         assertEquals(3, 2_500.toSummaryIntervalSeconds())
         assertEquals(10, 10_000.toSummaryIntervalSeconds())
+    }
+
+    @Test fun adaptiveSummaryCadenceUsesWarmupMiddleAndSustainedPhases() {
+        assertEquals(5_000, adaptiveSummaryCadenceMillis(0))
+        assertEquals("warmup", adaptiveSummaryCadencePhase(59))
+        assertEquals(8_000, adaptiveSummaryCadenceMillis(60))
+        assertEquals("middle", adaptiveSummaryCadencePhase(119))
+        assertEquals(10_000, adaptiveSummaryCadenceMillis(120))
+        assertEquals("sustained", adaptiveSummaryCadencePhase(300))
     }
 
     @Test fun unchangedSummaryCommitDoesNotAppendHistory() {
@@ -173,6 +183,13 @@ class CoreLogicTest {
         assertEquals(fullDelta, inputs.fullDelta)
     }
 
+    @Test fun summaryDeltaGuardStartsAtThreeChineseChars() {
+        assertEquals(3, MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS)
+        assertEquals("新新", "舊舊新新".deltaSince("舊舊"))
+        assertTrue("新新".length < MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS)
+        assertTrue("新新新".length >= MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS)
+    }
+
     @Test fun summaryGateCoalescesOverlappingRequests() {
         val gate = SummaryRequestGate()
         assertTrue(gate.tryStart())
@@ -211,6 +228,13 @@ class CoreLogicTest {
             doneSeen = true,
             parseStage = "stream_final_model_output",
             finishReason = "stop",
+            retryAfterSeconds = "12",
+            rateLimitLimitRequests = "1000",
+            rateLimitRemainingRequests = "0",
+            rateLimitResetRequests = "2m59.56s",
+            rateLimitLimitTokens = "8000",
+            rateLimitRemainingTokens = "42",
+            rateLimitResetTokens = "7.66s",
             responseHash = "abc123",
             safeResponseExcerpt = """{"globalContext":"Draft"}""",
         )
@@ -232,8 +256,57 @@ class CoreLogicTest {
         assertTrue(line.contains("parseStage=stream_final_model_output"))
         assertTrue(line.contains("finishReason=stop"))
         assertTrue(line.contains("sseErrorSeen=no"))
+        assertTrue(line.contains("retryAfterSeconds=12"))
+        assertTrue(line.contains("rateLimitLimitRequests=1000"))
+        assertTrue(line.contains("rateLimitRemainingRequests=0"))
+        assertTrue(line.contains("rateLimitResetRequests=2m59.56s"))
+        assertTrue(line.contains("rateLimitLimitTokens=8000"))
+        assertTrue(line.contains("rateLimitRemainingTokens=42"))
+        assertTrue(line.contains("rateLimitResetTokens=7.66s"))
         assertTrue(line.contains("responseHash=abc123"))
         assertTrue(line.contains("""safeResponseExcerpt={"globalContext":"Draft"}"""))
+    }
+
+    @Test fun rateLimitCooldownUsesRetryAfterBeforeResetHeaders() {
+        val decision = rateLimitCooldownDecision(
+            RemoteFailureDiagnostics(
+                retryAfterSeconds = "12",
+                rateLimitRemainingRequests = "0",
+                rateLimitResetRequests = "2m59.56s",
+            ),
+        )
+
+        assertEquals("retry-after", decision.source)
+        assertEquals(12_000L, decision.durationMillis)
+    }
+
+    @Test fun rateLimitCooldownUsesResetHeadersForExhaustedBuckets() {
+        val decision = rateLimitCooldownDecision(
+            RemoteFailureDiagnostics(
+                rateLimitRemainingRequests = "0",
+                rateLimitResetRequests = "2m59.56s",
+                rateLimitRemainingTokens = "0",
+                rateLimitResetTokens = "7.66s",
+            ),
+        )
+
+        assertEquals("ratelimit-reset-requests-and-tokens", decision.source)
+        assertEquals(179_560L, decision.durationMillis)
+    }
+
+    @Test fun rateLimitBackoffSkipsUntilCooldownExpiresAndThenClears() {
+        var now = 1_000L
+        val backoff = SummaryRateLimitBackoff { now }
+
+        val cooldown = backoff.recordFailure(
+            modelId = GROQ_GPT_OSS_20B_REMOTE_MODEL_ID,
+            diagnostics = RemoteFailureDiagnostics(retryAfterSeconds = "5"),
+        )
+
+        assertEquals(6_000L, cooldown.untilMillis)
+        assertNotNull(backoff.cooldownFor(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID))
+        now = 6_000L
+        assertNull(backoff.cooldownFor(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID))
     }
 
     @Test fun detailedSummaryTraceIncludesDebugGuideSnapshotAndRuntimeLog() {
@@ -248,6 +321,7 @@ class CoreLogicTest {
         assertTrue(text.contains("Session ID: 7"))
         assertTrue(text.contains("If the Chinese transcript is good but English is missing"))
         assertTrue(text.contains("missing_openrouter_key"))
+        assertTrue(text.contains("stable_transcript_delta_below_minimum"))
         assertTrue(text.contains("phase=Waiting for OpenRouter key"))
         assertTrue(text.contains("Persisted summary"))
         assertTrue(text.contains("summary_attempt_skipped"))

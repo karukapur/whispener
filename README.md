@@ -37,10 +37,11 @@ On first launch:
 - Audio is captured as 16 kHz mono PCM inside a microphone foreground service. It is buffered only in memory, never written to disk, and never uploaded.
 - Energy-based voice activity detection creates bounded utterances. A six-utterance inference queue stops with an explicit error instead of silently dropping audio if the device cannot keep up.
 - whisper.cpp transcribes locally with language `zh`, Traditional Chinese prompting, rolling overlap, and automatic Vulkan-to-CPU fallback. The app stores immutable finalized timestamped segments in Room; provisional text and audio remain memory-only.
-- When remote summaries are enabled, each selected interval containing new finalized text sends the prior English context, a small Chinese continuity tail, and the new finalized Chinese delta to the selected provider. The requested response is an English `globalContext` with concise English `details`.
+- When remote summaries are enabled, each selected interval containing at least three new finalized Chinese characters sends the prior English context, a small Chinese continuity tail, and the new finalized Chinese delta to the selected provider. Smaller deltas remain pending until more finalized text arrives. The requested response is an English `globalContext` with concise English `details`.
 - If a selected OpenRouter model has no structured-output endpoint, the app retries once with `openrouter/free`. Failed remote summaries do not mark Chinese text as summarized.
-- Groq uses the fixed `openai/gpt-oss-20b` model with low reasoning effort and strict, non-streaming structured output. Its cadence range is 2–10 seconds to respect the free plan's 30-request-per-minute ceiling; OpenRouter retains the 500 ms–10 s range.
+- Groq uses the fixed `openai/gpt-oss-20b` model with low reasoning effort and strict non-streaming structured output. Remote summaries currently use a shared adaptive cadence trial across the remote model suite: 5 seconds for the first minute, 8 seconds for the second minute, and 10 seconds afterward. The schedule is based on Groq cadence experiments and should be revalidated before treating it as OpenRouter-specific evidence.
 - Streaming summaries may show parseable draft context as fields arrive, but final commits require validated JSON. Malformed streamed or non-streamed output clears only the draft/streaming indicator, keeps the last valid English context, and records bounded diagnostics such as response length, parse stage, finish reason, `[DONE]` state, a hash, and a short redacted excerpt.
+- Rate-limited Groq/OpenRouter responses record safe provider headers such as retry-after, remaining request/token counts, and reset windows when returned. The app then pauses retries for that model during the cooldown while preserving unsummarized finalized Chinese text.
 - Offline, timeout, invalid-key, rate-limit, and malformed-output failures keep the last valid English context. They never stop local transcription.
 - The OpenRouter Settings key is stored with Android Keystore-backed encrypted preferences. Debug build keys are compiled into the APK. Backups and cleartext network traffic are disabled.
 - A daily WorkManager task enforces the chosen local retention period. Session deletion remains explicitly confirmed in the UI.
@@ -64,5 +65,5 @@ Flip6 acceptance covers portrait, landscape, narrow split-screen, cover-window b
 
 - This is a USB-installed debug beta, not a release-signed or Play Store build.
 - Native inference is initially CPU-only and packaged for `arm64-v8a`; Flip6 latency and thermals must be measured before expanding model defaults.
-- OpenRouter free-model availability and quotas can change. The app does not invent a remaining-quota value; it reports actual API failures and retains the last valid context.
+- OpenRouter and Groq free-model availability and quotas can change. The app does not invent a remaining-quota value; it reports actual API failures, logs safe rate-limit headers when available, and retains the last valid context.
 - No physical Flip6 measurements have been recorded in this repository yet.

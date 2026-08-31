@@ -70,9 +70,7 @@ import com.listener.app.SummaryDiagnostics
 import com.listener.app.StreamingContextState
 import com.listener.app.context.ListeningContext
 import com.listener.app.context.RemoteStatus
-import com.listener.app.data.MAX_SUMMARY_CADENCE_MILLIS
 import com.listener.app.data.MIN_SUMMARY_CADENCE_MILLIS
-import com.listener.app.data.SUMMARY_CADENCE_STEP_MILLIS
 import com.listener.app.data.TranscriptionEngine
 import com.listener.app.data.WhisperWorkProfile
 import com.listener.app.data.minimumSummaryCadenceMillis
@@ -1122,24 +1120,13 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     }
 }
 
+@Suppress("UNUSED_PARAMETER")
 @Composable internal fun CadenceSlider(intervalMillis: Int, minimumIntervalMillis: Int, change: (Int) -> Unit, modifier: Modifier = Modifier) {
-    val minimum = minimumIntervalMillis.snapSummaryCadenceMillis()
-    val snapped = intervalMillis.coerceAtLeast(minimum).snapSummaryCadenceMillis()
     Column(modifier) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
             Text("Summary interval", style = MaterialTheme.typography.titleMedium)
-            LanguageChip("Every ${snapped.formatCadenceMillis()}")
+            LanguageChip("Adaptive 5-10s")
         }
-        Slider(
-            value = snapped.toFloat(),
-            onValueChange = { change(it.toInt().coerceAtLeast(minimum).snapSummaryCadenceMillis()) },
-            valueRange = minimum.toFloat()..MAX_SUMMARY_CADENCE_MILLIS.toFloat(),
-            steps = ((MAX_SUMMARY_CADENCE_MILLIS - minimum) / SUMMARY_CADENCE_STEP_MILLIS) - 1,
-            modifier = Modifier
-                .fillMaxWidth()
-                .testTag("cadence-slider")
-                .semantics { contentDescription = "Summary cadence ${snapped.formatCadenceMillis()}" },
-        )
     }
 }
 

@@ -413,7 +413,7 @@ private fun ModelInfoDialog(
                 ModelInfoBullet("Summaries are generated automatically when new finalized Chinese text is available.")
                 ModelInfoBullet("OpenRouter models are compatible free text models ranked by OpenRouter latency.")
                 ModelInfoBullet("OpenRouter free router automatically selects a compatible free model.")
-                ModelInfoBullet("Groq GPT-OSS 20B has a 2 second minimum cadence, so the slider cannot go below 2 seconds when it is selected.")
+                ModelInfoBullet("Remote summaries currently use an adaptive 5, 8, then 10 second cadence based on Groq experiment evidence.")
                 if (groqApiKeyPresent) {
                     ModelInfoBullet("Groq GPT-OSS 20B is available from this debug build's local properties.")
                 }
@@ -453,7 +453,7 @@ private fun RemoteModelCompanyMark(model: OpenRouterModel) {
 @Composable
 private fun RemoteModelMetaLine(model: OpenRouterModel) {
     val badge = when (model.id) {
-        GROQ_GPT_OSS_20B_REMOTE_MODEL_ID -> "2s min"
+        GROQ_GPT_OSS_20B_REMOTE_MODEL_ID -> "Adaptive"
         OPENROUTER_FREE_ROUTER_MODEL_ID -> "Auto"
         else -> "Free"
     }

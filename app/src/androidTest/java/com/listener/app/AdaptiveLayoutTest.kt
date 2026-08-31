@@ -252,7 +252,7 @@ class AdaptiveLayoutTest {
         compose.onNodeWithTag("context-history-item").assertDoesNotExist()
     }
 
-    @Test fun settingsCadenceSliderShowsDecimalValuesAndReportsSnappedMillis() {
+    @Test fun settingsCadenceShowsAdaptiveScheduleForRemoteSuite() {
         var selected = 2_000
         setTestContent {
             MaterialTheme {
@@ -277,12 +277,10 @@ class AdaptiveLayoutTest {
             }
         }
         compose.onNodeWithText("Summary interval").assertExists()
-        compose.onNodeWithText("Every 2.5s").assertExists()
-        compose.onNodeWithContentDescription("Summary cadence 2.5s").assertExists()
-        compose.onNodeWithTag("cadence-slider").performTouchInput { swipeLeft() }
+        compose.onNodeWithText("Adaptive 5-10s").assertExists()
+        compose.onNodeWithTag("cadence-slider").assertDoesNotExist()
         compose.runOnIdle {
-            assertTrue(selected in 500..10_000)
-            assertEquals(0, selected % 500)
+            assertEquals(2_000, selected)
         }
     }
 
@@ -343,7 +341,7 @@ class AdaptiveLayoutTest {
         compose.onAllNodesWithText("Summary model").assertCountEquals(1)
     }
 
-    @Test fun groqCadenceSliderCannotGoBelowTwoSeconds() {
+    @Test fun groqCadenceUsesAdaptiveRemoteSuiteSchedule() {
         var selected = 0
         setTestContent {
             MaterialTheme {
@@ -369,10 +367,10 @@ class AdaptiveLayoutTest {
         }
 
         compose.onNodeWithText("Summary interval").assertExists()
-        compose.onNodeWithText("Every 2s").assertExists()
-        compose.onNodeWithText("Groq uses this cadence with a 2s minimum.").assertExists()
-        compose.onNodeWithContentDescription("Summary cadence 2s").performTouchInput { swipeLeft() }
-        compose.runOnIdle { assertTrue(selected >= 2_000) }
+        compose.onNodeWithText("Adaptive 5-10s").assertExists()
+        compose.onNodeWithText("Remote summaries currently use an adaptive 5, 8, then 10 second cadence based on Groq experiment evidence.").assertExists()
+        compose.onNodeWithTag("cadence-slider").assertDoesNotExist()
+        compose.runOnIdle { assertEquals(0, selected) }
     }
 
     @Test fun remoteErrorsStayInsideEnglishContextPanel() {
