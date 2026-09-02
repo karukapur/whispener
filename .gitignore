@@ -10,3 +10,4 @@ captures/
 experiments/cadence_expts/results/
 traces/files
 artifacts/
+experiments/noisy_particle_sphere/*

@@ -10,7 +10,7 @@ elif [[ -x "${SCRIPT_DIR}/listener/gradlew" ]]; then
   PROJECT_DIR="${SCRIPT_DIR}/listener"
 else
   echo "Could not find the listener Gradle project from ${SCRIPT_DIR}" >&2
-  exit 1
+  exit 
 fi
 
 cd "${PROJECT_DIR}"
