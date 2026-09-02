@@ -31,6 +31,8 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
 import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.foundation.shape.CircleShape
@@ -40,6 +42,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.blur
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
@@ -58,6 +61,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
@@ -344,6 +348,7 @@ private const val TabSlideDistanceDivisor = 18
     recordingAvailable: Boolean = true,
     modelLoading: Boolean = false,
     stopping: Boolean = false,
+    animateIdleSphere: Boolean = true,
     audioLevel: Float = 0f,
     activeModelId: String? = null,
     backend: InferenceBackend? = null,
@@ -375,6 +380,8 @@ private const val TabSlideDistanceDivisor = 18
                         remoteMessage = remoteMessage,
                         emptyMessage = emptyContextMessage,
                         orbActive = recording || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
+                        showIdleSphere = !recording && !modelLoading && !stopping,
+                        animateIdleSphere = animateIdleSphere,
                         modifier = Modifier.weight(contextRatio).fillMaxHeight(),
                     )
                     Splitter(
@@ -392,6 +399,8 @@ private const val TabSlideDistanceDivisor = 18
                     remoteMessage = remoteMessage,
                     emptyMessage = emptyContextMessage,
                     orbActive = recording || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
+                    showIdleSphere = !recording && !modelLoading && !stopping,
+                    animateIdleSphere = animateIdleSphere,
                     modifier = Modifier.weight(contextRatio).fillMaxWidth(),
                 )
                 Splitter(
@@ -556,6 +565,8 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
     remoteMessage: String?,
     emptyMessage: String,
     orbActive: Boolean,
+    showIdleSphere: Boolean,
+    animateIdleSphere: Boolean,
     modifier: Modifier,
 ) {
     val scroll = rememberScrollState()
@@ -583,6 +594,9 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
             scroll.animateScrollTo(scroll.maxValue)
         }
     }
+    val idleSphereVisible = displayedContext == null && showIdleSphere
+    val sphereSize = 462.dp
+    val sphereCutOffset = 64.dp
     Card(
         modifier = modifier.testTag("context-card"),
         shape = MaterialTheme.shapes.extraLarge,
@@ -593,88 +607,133 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
     ) {
-        Column(Modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = ListenerSpacing.Large)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Row(
-                    Modifier.weight(1f),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
-                        androidx.compose.animation.AnimatedVisibility(visible = orbActive, enter = fadeIn(), exit = fadeOut()) {
-                            ThinkingOrb(
-                                state = ThinkingOrbState.Solving,
-                                size = ThinkingOrbSize.Inline,
-                                diameter = inlineOrbDiameter,
-                                primaryColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                                secondaryColor = MaterialTheme.colorScheme.onPrimaryContainer,
-                                contentDescription = "English context updating",
-                            )
-                        }
-                        Text(
-                            "English context",
-                            style = titleStyle,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(start = titleStartPadding),
-                        )
-                    }
+        Box(Modifier.fillMaxSize().clipToBounds()) {
+            androidx.compose.animation.AnimatedVisibility(
+                visible = idleSphereVisible,
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .offset(x = sphereCutOffset)
+                    .zIndex(0f),
+                enter = fadeIn(animationSpec = tween(ListenerMotion.DefaultDurationMillis)) +
+                    scaleIn(
+                        initialScale = 0.96f,
+                        animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
+                    ),
+                exit = fadeOut(animationSpec = tween(ListenerMotion.DefaultDurationMillis)) +
+                    scaleOut(
+                        targetScale = 0.96f,
+                        animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
+                    ),
+            ) {
+                Box(Modifier.testTag("idle-particle-sphere")) {
+                    IdleParticleSphere(
+                        size = sphereSize,
+                        particleColor = MaterialTheme.colorScheme.primary,
+                        haloColor = MaterialTheme.colorScheme.primary,
+                        particleRadiusScale = 0.5f,
+                        paused = !animateIdleSphere,
+                        modifier = Modifier.graphicsLayer { alpha = 0.82f },
+                    )
                 }
             }
-            if (contextState.isStreaming) StreamingIndicator(Modifier.padding(top = ListenerSpacing.Small))
-            if (displayedContext == null) {
-                Column(
-                    Modifier.fillMaxWidth().weight(1f),
-                    horizontalAlignment = Alignment.Start,
-                    verticalArrangement = Arrangement.Center,
-                ) {
-                    Text(
-                        "Follow the conversation",
-                        style = MaterialTheme.typography.titleLarge,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        textAlign = TextAlign.Start,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Text(
-                        emptyMessage.ifBlank { "Your English context will appear here once you start listening." },
-                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.76f),
-                        style = MaterialTheme.typography.bodySmall,
-                        textAlign = TextAlign.Start,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).testTag("english-context-empty"),
-                    )
-                }
-            } else {
-                Column(Modifier.padding(top = ListenerSpacing.Medium).weight(1f).verticalScroll(scroll)) {
-                    if (heading.isNotBlank()) AnimatedSequentialText(
-                        heading,
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.testTag("context-heading"),
-                    )
-                    displayedContext.details.takeIf { it.isNotEmpty() }?.let { details ->
-                        Column(Modifier.padding(top = ListenerSpacing.Small), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.ExtraSmall)) {
-                            details.forEach { detail ->
-                                AnimatedSequentialText(
-                                    "• $detail",
-                                    style = MaterialTheme.typography.bodyMedium,
-                                    color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.82f),
-                                    modifier = Modifier.testTag("context-current-detail"),
+            Column(
+                Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 20.dp, vertical = ListenerSpacing.Large)
+                    .zIndex(1f),
+            ) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        Modifier.weight(1f),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+                            androidx.compose.animation.AnimatedVisibility(visible = orbActive, enter = fadeIn(), exit = fadeOut()) {
+                                ThinkingOrb(
+                                    state = ThinkingOrbState.Solving,
+                                    size = ThinkingOrbSize.Inline,
+                                    diameter = inlineOrbDiameter,
+                                    primaryColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    secondaryColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    contentDescription = "English context updating",
                                 )
+                            }
+                            Text(
+                                "English context",
+                                style = titleStyle,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.padding(start = titleStartPadding),
+                            )
+                        }
+                    }
+                }
+                if (contextState.isStreaming) StreamingIndicator(Modifier.padding(top = ListenerSpacing.Small))
+                if (displayedContext == null) {
+                    BoxWithConstraints(
+                        Modifier.fillMaxWidth().weight(1f),
+                    ) {
+                        val textWidthFraction = if (maxWidth < 340.dp) 0.52f else 0.48f
+                        Column(
+                            Modifier
+                                .fillMaxWidth(textWidthFraction)
+                                .align(Alignment.CenterStart),
+                            horizontalAlignment = Alignment.Start,
+                            verticalArrangement = Arrangement.Center,
+                        ) {
+                            Text(
+                                "Follow the\nconversation",
+                                style = MaterialTheme.typography.titleLarge,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                textAlign = TextAlign.Start,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                emptyMessage.ifBlank { "Appears after start." },
+                                color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.76f),
+                                style = MaterialTheme.typography.bodySmall,
+                                textAlign = TextAlign.Start,
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = ListenerSpacing.ExtraSmall)
+                                    .testTag("english-context-empty"),
+                            )
+                        }
+                    }
+                } else {
+                    Column(Modifier.padding(top = ListenerSpacing.Medium).weight(1f).verticalScroll(scroll)) {
+                        if (heading.isNotBlank()) AnimatedSequentialText(
+                            heading,
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.testTag("context-heading"),
+                        )
+                        displayedContext.details.takeIf { it.isNotEmpty() }?.let { details ->
+                            Column(Modifier.padding(top = ListenerSpacing.Small), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.ExtraSmall)) {
+                                details.forEach { detail ->
+                                    AnimatedSequentialText(
+                                        "• $detail",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.82f),
+                                        modifier = Modifier.testTag("context-current-detail"),
+                                    )
+                                }
                             }
                         }
                     }
                 }
-            }
-            status?.let {
-                val isError = remoteStatus != RemoteStatus.Ready
-                Surface(
-                    color = if (isError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
-                    contentColor = if (isError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
-                    shape = MaterialTheme.shapes.small,
-                    modifier = Modifier.padding(top = ListenerSpacing.Small).fillMaxWidth().testTag("english-context-status"),
-                ) {
-                    Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.Small))
+                status?.let {
+                    val isError = remoteStatus != RemoteStatus.Ready
+                    Surface(
+                        color = if (isError) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
+                        contentColor = if (isError) MaterialTheme.colorScheme.onErrorContainer else MaterialTheme.colorScheme.onSecondaryContainer,
+                        shape = MaterialTheme.shapes.small,
+                        modifier = Modifier.padding(top = ListenerSpacing.Small).fillMaxWidth().testTag("english-context-status"),
+                    ) {
+                        Text(it, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(horizontal = ListenerSpacing.Medium, vertical = ListenerSpacing.Small))
+                    }
                 }
             }
         }

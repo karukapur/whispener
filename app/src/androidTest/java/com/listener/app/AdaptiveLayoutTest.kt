@@ -44,7 +44,7 @@ class AdaptiveLayoutTest {
     }
 
     @Test fun foldedLayoutKeepsTranscriptAndControlVisible() {
-        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
+        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}, animateIdleSphere = false) }
         compose.onNodeWithTag("transcript").assertExists(); compose.onNodeWithTag("record-toggle").assertIsDisplayed()
         compose.onNodeWithText("English context").assertExists()
         compose.onNodeWithText("Listen").assertExists()
@@ -54,14 +54,60 @@ class AdaptiveLayoutTest {
     }
 
     @Test fun emptyListenStateExplainsBothPanels() {
-        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}) }
+        setTestContent { ListeningScreen(false, 0, 5_000, {}, {}, animateIdleSphere = false) }
 
         compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
         compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
-        compose.onNodeWithText("Follow the conversation").assertExists()
-        compose.onNodeWithText("Your English context will appear here once you start listening.").assertExists()
+        compose.onNodeWithTag("idle-particle-sphere").assertIsDisplayed()
+        compose.onNodeWithText("Follow the\nconversation").assertExists()
+        compose.onNodeWithText("Appears after start.").assertExists()
         compose.onNodeWithTag("transcript-empty").assertExists()
         compose.onNodeWithText("Traditional Chinese will appear here.").assertExists()
+    }
+
+    @Test fun idleSphereHidesWhileRecording() {
+        setTestContent { ListeningScreen(true, 0, 5_000, {}, {}) }
+
+        compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
+        compose.onNodeWithTag("idle-particle-sphere").assertDoesNotExist()
+    }
+
+    @Test fun idleSphereHidesWhileLoading() {
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 5_000,
+                onIntervalChange = {},
+                onToggle = {},
+                animateIdleSphere = false,
+                modelLoading = true,
+                activeModelId = "paraformer",
+            )
+        }
+
+        compose.onNodeWithTag("english-context-empty").assertIsDisplayed()
+        compose.onNodeWithTag("idle-particle-sphere").assertDoesNotExist()
+    }
+
+    @Test fun idleSphereHidesWhenEnglishContextExists() {
+        setTestContent {
+            ListeningScreen(
+                recording = false,
+                elapsedSeconds = 0,
+                intervalMillis = 5_000,
+                onIntervalChange = {},
+                onToggle = {},
+                animateIdleSphere = false,
+                contextState = StreamingContextState(
+                    current = ListeningContext("Committed topic", listOf("Committed detail")),
+                    history = listOf(ContextHistoryEntry(ListeningContext("Committed topic", listOf("Committed detail")), 1L)),
+                ),
+            )
+        }
+
+        compose.onNodeWithTag("context-current-detail").assertExists()
+        compose.onNodeWithTag("idle-particle-sphere").assertDoesNotExist()
     }
 
     @Test fun loadingStateKeepsCommittedContextVisibleAndOffersCancel() {
@@ -98,6 +144,7 @@ class AdaptiveLayoutTest {
                 intervalMillis = 5_000,
                 onIntervalChange = {},
                 onToggle = {},
+                animateIdleSphere = false,
                 statusMessage = "Microphone permission is required to transcribe speech.",
                 statusIsError = true,
             )
@@ -111,7 +158,7 @@ class AdaptiveLayoutTest {
     @Test fun listenPanelsRemainSideBySideInWideLandscape() {
         requestOrientation(ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE, Configuration.ORIENTATION_LANDSCAPE)
         setTestContent {
-            ListeningScreen(false, 0, 5_000, {}, {})
+            ListeningScreen(false, 0, 5_000, {}, {}, animateIdleSphere = false)
         }
 
         val context = compose.onNodeWithTag("context-card").getUnclippedBoundsInRoot()
@@ -124,7 +171,7 @@ class AdaptiveLayoutTest {
         requestOrientation(ActivityInfo.SCREEN_ORIENTATION_PORTRAIT, Configuration.ORIENTATION_PORTRAIT)
         setTestContent {
             Box(Modifier.size(width = 360.dp, height = 720.dp)) {
-                ListeningScreen(false, 0, 5_000, {}, {})
+                ListeningScreen(false, 0, 5_000, {}, {}, animateIdleSphere = false)
             }
         }
 
@@ -137,7 +184,7 @@ class AdaptiveLayoutTest {
         compose.onNodeWithContentDescription("Recording active").assertExists()
     }
     @Test fun recordingRequiresInstalledModel() {
-        setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, recordingAvailable = false) }
+        setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, animateIdleSphere = false, recordingAvailable = false) }
         compose.onNodeWithTag("record-toggle").assertIsEnabled()
         compose.onNodeWithText("Install model").assertExists()
     }
@@ -150,6 +197,7 @@ class AdaptiveLayoutTest {
                 intervalMillis = 10_000,
                 onIntervalChange = {},
                 onToggle = {},
+                animateIdleSphere = false,
                 statusMessage = "Install Paraformer before recording.",
                 statusIsError = true,
                 downloadModelId = "sherpa-onnx-streaming-paraformer-bilingual-zh-en",
