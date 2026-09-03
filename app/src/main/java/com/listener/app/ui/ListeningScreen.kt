@@ -589,7 +589,7 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
     }
     val idleSphereVisible = displayedContext == null && showIdleSphere
     val sphereSize = 462.dp
-    val sphereCutOffset = 84.dp
+    val sphereCutOffset = 120.dp
     Card(
         modifier = modifier.testTag("context-card"),
         shape = MaterialTheme.shapes.extraLarge,
