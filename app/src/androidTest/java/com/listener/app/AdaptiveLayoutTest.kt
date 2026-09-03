@@ -79,7 +79,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 0,
                 intervalMillis = 5_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 animateIdleSphere = false,
                 modelLoading = true,
                 activeModelId = "paraformer",
@@ -97,7 +99,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 0,
                 intervalMillis = 5_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 animateIdleSphere = false,
                 contextState = StreamingContextState(
                     current = ListeningContext("Committed topic", listOf("Committed detail")),
@@ -117,7 +121,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 0,
                 intervalMillis = 2_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 contextState = StreamingContextState(
                     current = ListeningContext("Committed topic", listOf("Committed detail")),
                     history = listOf(ContextHistoryEntry(ListeningContext("Committed topic", listOf("Committed detail")), 1L)),
@@ -143,7 +149,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 0,
                 intervalMillis = 5_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 animateIdleSphere = false,
                 statusMessage = "Microphone permission is required to transcribe speech.",
                 statusIsError = true,
@@ -207,6 +215,128 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("Install model").assertExists()
     }
 
+    @Test fun activeRecordingShowsPauseAndStopActions() {
+        var paused = false
+        var stopped = false
+        setTestContent {
+            ListeningScreen(
+                recording = true,
+                elapsedSeconds = 4,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onStart = {},
+                onPauseResume = { paused = true },
+                onStop = { stopped = true },
+            )
+        }
+
+        compose.onNodeWithTag("record-toggle").assertDoesNotExist()
+        compose.onNodeWithTag("record-pause-resume").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithTag("record-stop").assertIsDisplayed().assertIsEnabled()
+        compose.onNodeWithContentDescription("Pause listening").assertExists()
+        compose.onNodeWithContentDescription("Stop listening").assertExists()
+        compose.onNodeWithText("Pause").assertExists()
+        compose.onNodeWithText("Stop").assertExists()
+        compose.onNodeWithTag("record-pause-resume").performClick()
+        compose.onNodeWithTag("record-stop").performClick()
+        compose.runOnIdle {
+            assertTrue(paused)
+            assertTrue(stopped)
+        }
+    }
+
+    @Test fun pausedRecordingShowsResumeAndNeutralTitle() {
+        setTestContent {
+            ListeningScreen(
+                recording = true,
+                paused = true,
+                elapsedSeconds = 4,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
+            )
+        }
+
+        compose.onNodeWithContentDescription("Paused").assertExists()
+        compose.onNodeWithContentDescription("Listening, recording active").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Resume listening").assertExists()
+        compose.onNodeWithText("Resume").assertExists()
+        compose.onNodeWithTag("record-stop").assertIsDisplayed()
+    }
+
+    @Test fun pausedTitleReturnsToListenAfterStop() {
+        val recording = mutableStateOf(true)
+        val paused = mutableStateOf(true)
+        setTestContent {
+            ListeningScreen(
+                recording = recording.value,
+                paused = paused.value,
+                elapsedSeconds = 4,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
+            )
+        }
+
+        compose.onNodeWithContentDescription("Paused").assertExists()
+        compose.runOnIdle {
+            recording.value = false
+            paused.value = false
+        }
+
+        compose.onNodeWithContentDescription("Listen").assertExists()
+        compose.onNodeWithText("Listen").assertExists()
+        compose.onNodeWithText("Paused").assertDoesNotExist()
+    }
+
+    @Test fun pausedTitleTypesToListeningAfterResume() {
+        val paused = mutableStateOf(true)
+        setTestContent {
+            ListeningScreen(
+                recording = true,
+                paused = paused.value,
+                elapsedSeconds = 4,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
+            )
+        }
+
+        compose.onNodeWithContentDescription("Paused").assertExists()
+        compose.runOnIdle { paused.value = false }
+
+        compose.onNodeWithContentDescription("Listening, recording active").assertExists()
+        compose.waitUntil(timeoutMillis = 1_000) {
+            compose.onAllNodesWithText("Listening").fetchSemanticsNodes().isNotEmpty()
+        }
+        compose.onNodeWithText("Pauseding").assertDoesNotExist()
+    }
+
+    @Test fun stoppingDisablesPauseResumeAndStopControls() {
+        setTestContent {
+            ListeningScreen(
+                recording = true,
+                elapsedSeconds = 4,
+                intervalMillis = 10_000,
+                onIntervalChange = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
+                stopping = true,
+            )
+        }
+
+        compose.onNodeWithTag("record-pause-resume").assertIsNotEnabled()
+        compose.onNodeWithTag("record-stop").assertIsNotEnabled()
+        compose.onNodeWithText("Finishing...").assertExists()
+    }
+
     @Test fun modelInstallProgressDoesNotAppearOnListenScreen() {
         setTestContent {
             ListeningScreen(
@@ -214,7 +344,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 0,
                 intervalMillis = 10_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 animateIdleSphere = false,
                 statusMessage = "Install Paraformer before recording.",
                 statusIsError = true,
@@ -236,7 +368,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 2,
                 intervalMillis = 10_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 stableTranscript = "穩定",
                 provisionalTranscript = "暫定",
                 backend = InferenceBackend.VULKAN,
@@ -256,7 +390,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 2,
                 intervalMillis = 10_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 contextState = StreamingContextState(
                     current = ListeningContext("Current topic", listOf("Current detail")),
                     history = history,
@@ -276,7 +412,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 2,
                 intervalMillis = 10_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 contextState = StreamingContextState(
                     current = ListeningContext("Newest committed topic", listOf("Newest committed detail")),
                     history = listOf(
@@ -302,7 +440,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 2,
                 intervalMillis = 10_000,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 contextState = StreamingContextState(
                     current = current,
                     history = listOf(
@@ -446,7 +586,9 @@ class AdaptiveLayoutTest {
                 elapsedSeconds = 2,
                 intervalMillis = 500,
                 onIntervalChange = {},
-                onToggle = {},
+                onStart = {},
+                onPauseResume = {},
+                onStop = {},
                 stableTranscript = "你好",
                 remoteStatus = com.listener.app.context.RemoteStatus.ModelUnavailable,
                 remoteMessage = "No endpoints found for nvidia/nemotron-nano-9b-v2:free.",

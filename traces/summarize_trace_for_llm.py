@@ -291,6 +291,19 @@ def root_cause(events: list[TraceEvent], persisted_text: str) -> tuple[str, list
         evidence.append("Fix setup/preferences before investigating OpenRouter or local speech.")
         return summary, evidence
 
+    if skips.get("groq_token_budget_cooldown", 0):
+        summary = "Groq summary requests were locally held to avoid exceeding the token-per-minute budget."
+        evidence.append(f"{skips['groq_token_budget_cooldown']} summary attempt(s) skipped with groq_token_budget_cooldown.")
+        latest_budget_skip = next(
+            event for event in reversed(events)
+            if event.label == "summary_attempt_skipped" and event.fields.get("reason") == "groq_token_budget_cooldown"
+        )
+        for key in ["estimatedGroqRequestTokens", "tokenBudgetRemainingTokens", "cooldownRemainingMs"]:
+            value = latest_budget_skip.fields.get(key)
+            if value and value != "none":
+                evidence.append(f"Latest Groq budget {key}: {value}.")
+        return summary, evidence
+
     if skips.get("missing_openrouter_key", 0):
         summary = "OpenRouter key was missing when summaries attempted to run."
         evidence.append(f"{skips['missing_openrouter_key']} summary attempt(s) skipped with missing_openrouter_key.")
@@ -388,7 +401,7 @@ def brief_key_events(events: list[TraceEvent], limit: int) -> list[TraceEvent]:
         seen_failures.add(identity)
         selected.append(event)
 
-    for reason in ["remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_unchanged_since_last_sent", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown"]:
+    for reason in ["remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_unchanged_since_last_sent", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown", "groq_token_budget_cooldown"]:
         event = next(
             (
                 item
@@ -434,7 +447,7 @@ def full_key_events(events: list[TraceEvent], limit: int) -> list[TraceEvent]:
         event
         for event in events
         if event.label == "summary_attempt_skipped"
-        and event.fields.get("reason") in {"remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown"}
+        and event.fields.get("reason") in {"remote_summaries_disabled", "missing_openrouter_key", "missing_groq_key", "missing_remote_model", "missing_openrouter_model", "stable_transcript_empty", "stable_transcript_delta_below_minimum", "remote_rate_limit_cooldown", "groq_token_budget_cooldown"}
     )
     deduped: list[TraceEvent] = []
     seen: set[tuple[str, str, str]] = set()

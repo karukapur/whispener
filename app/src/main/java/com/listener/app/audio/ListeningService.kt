@@ -30,6 +30,7 @@ import kotlin.math.sqrt
 
 data class ListenerRuntimeState(
     val recording: Boolean = false,
+    val paused: Boolean = false,
     val modelLoading: Boolean = false,
     val stopping: Boolean = false,
     val elapsedSeconds: Long = 0,
@@ -86,14 +87,17 @@ internal class PcmRingBuffer(private val capacity: Int) {
 
 class ListeningService : LifecycleService() {
     private val running = AtomicBoolean(false)
+    private val paused = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
     private val committedThroughMs = AtomicLong(0)
+    private val capturedSampleOffset = AtomicLong(0)
     private var recorder: AudioRecord? = null
     private var captureJob: Job? = null
     private var processingJob: Job? = null
     private var sessionId: Long? = null
     private var focusRequest: AudioFocusRequest? = null
     private var workProfile = WhisperWorkProfile.RESPONSIVE
+    private var foregroundStatus = "Preparing local model"
     private var windows = Channel<AudioWindow>(Channel.CONFLATED)
     private var engine: WhisperEngine? = null
     private val repository by lazy { SessionRepository(DatabaseProvider.get(this).sessions()) }
@@ -110,6 +114,8 @@ class ListeningService : LifecycleService() {
                 WhisperWorkProfile.fromId(intent.getStringExtra(EXTRA_WORK_PROFILE)),
                 InferenceBackend.entries.firstOrNull { it.name == intent.getStringExtra(EXTRA_BACKEND) },
             )
+            ACTION_PAUSE -> pauseCapture()
+            ACTION_RESUME -> resumeCapture()
             ACTION_STOP -> lifecycleScope.launch { stopAndFlush() }
         }
         return START_NOT_STICKY
@@ -129,9 +135,11 @@ class ListeningService : LifecycleService() {
         windows = Channel(Channel.CONFLATED)
         workProfile = profile
         committedThroughMs.set(0)
+        capturedSampleOffset.set(0)
+        paused.set(false)
         val activeModel = modelId ?: File(modelPath).nameWithoutExtension.removePrefix("ggml-")
         (application as ListenerApplication).models.manager.markLoaded(activeModel)
-        ListeningRuntime.update { ListenerRuntimeState(recording = true, modelLoading = true, activeModelId = activeModel) }
+        ListeningRuntime.update { ListenerRuntimeState(recording = true, paused = false, modelLoading = true, activeModelId = activeModel) }
         processingJob = lifecycleScope.launch(Dispatchers.Default) {
             var failed = false
             try {
@@ -147,13 +155,19 @@ class ListeningService : LifecycleService() {
                     cadenceSeconds,
                 )
                 ListeningRuntime.update { it.copy(modelLoading = false, backend = backend, sessionId = sessionId) }
-                promoteToForeground("$activeModel · ${backend.label}")
-                captureJob = lifecycleScope.launch(Dispatchers.IO) { captureLoop() }
+                foregroundStatus = "$activeModel · ${backend.label}"
+                if (paused.get()) {
+                    promoteToForeground("Paused")
+                } else {
+                    promoteToForeground(foregroundStatus)
+                    captureJob = lifecycleScope.launch(Dispatchers.IO) { captureLoop() }
+                }
                 processWindows()
             } catch (error: Throwable) {
                 failed = error !is CancellationException
                 if (failed) ListeningRuntime.update { it.copy(recoverableError = error.message ?: "Transcription failed") }
                 running.set(false)
+                paused.set(false)
                 recorder?.runCatching { stop() }
             } finally {
                 engine?.close()
@@ -203,6 +217,7 @@ class ListeningService : LifecycleService() {
             .build()
         if (audioRecord.state != AudioRecord.STATE_INITIALIZED) return failCapture("Unable to initialize the microphone.")
         recorder = audioRecord
+        val baseSamples = capturedSampleOffset.get()
         val block = ShortArray(maxOf(minSize / 2, RATE / 10))
         val audio = PcmRingBuffer(RATE * MAX_BUFFER_SECONDS)
         var nextDecodeSample = RATE.toLong() * decodeStepSeconds()
@@ -210,11 +225,11 @@ class ListeningService : LifecycleService() {
         var speechSinceDecode = false
         try {
             audioRecord.startRecording()
-            while (running.get()) {
+            while (running.get() && !paused.get()) {
                 val count = audioRecord.read(block, 0, block.size, AudioRecord.READ_BLOCKING)
                 if (count <= 0) continue
                 audio.append(block, count)
-                val nowMs = samplesToMs(audio.totalSamples)
+                val nowMs = samplesToMs(baseSamples + audio.totalSamples)
                 val level = audioLevel(block, count)
                 val hasSpeech = containsSpeech(block, count)
                 if (hasSpeech) { lastSpeechMs = nowMs; speechSinceDecode = true }
@@ -231,18 +246,21 @@ class ListeningService : LifecycleService() {
                 val silenceFinalize = speechSinceDecode && !hasSpeech && nowMs - lastSpeechMs >= SILENCE_FINALIZE_MS
                 if (audio.totalSamples >= nextDecodeSample || silenceFinalize) {
                     if (speechSinceDecode || nowMs - lastSpeechMs <= RECENT_SPEECH_MS) {
-                        windows.trySend(makeWindow(audio, nowMs, final = false))
+                        windows.trySend(makeWindow(audio, nowMs, baseSamples, final = false))
                     }
                     speechSinceDecode = false
                     nextDecodeSample = audio.totalSamples + RATE.toLong() * decodeStepSeconds()
                 }
             }
         } catch (error: Throwable) {
-            if (running.get()) failCapture(error.message ?: "Microphone capture failed")
+            if (running.get() && !paused.get()) failCapture(error.message ?: "Microphone capture failed")
         } finally {
-            val endMs = samplesToMs(audio.totalSamples)
-            if (audio.size > 0) windows.trySend(makeWindow(audio, endMs, final = true))
-            windows.close()
+            val endMs = samplesToMs(baseSamples + audio.totalSamples)
+            capturedSampleOffset.accumulateAndGet(baseSamples + audio.totalSamples, ::maxOf)
+            if (!paused.get()) {
+                if (audio.size > 0) windows.trySend(makeWindow(audio, endMs, baseSamples, final = true))
+                windows.close()
+            }
             audioRecord.runCatching { stop() }
             audioRecord.release()
             recorder = null
@@ -250,12 +268,13 @@ class ListeningService : LifecycleService() {
         }
     }
 
-    private fun makeWindow(audio: PcmRingBuffer, endMs: Long, final: Boolean): AudioWindow {
+    private fun makeWindow(audio: PcmRingBuffer, endMs: Long, baseSamples: Long, final: Boolean): AudioWindow {
         val overlapStart = (committedThroughMs.get() - overlapMs()).coerceAtLeast(0)
         val normalStart = (endMs - windowMs()).coerceAtLeast(0)
         val desiredStartMs = minOf(normalStart, overlapStart)
-        val startSample = maxOf(audio.earliestSample, desiredStartMs * RATE / 1_000)
-        return AudioWindow(audio.snapshotFrom(startSample), samplesToMs(startSample), endMs, final)
+        val desiredSample = desiredStartMs * RATE / 1_000
+        val startSample = maxOf(baseSamples + audio.earliestSample, desiredSample)
+        return AudioWindow(audio.snapshotFrom(startSample - baseSamples), samplesToMs(startSample), endMs, final)
     }
 
     private fun decodeStepSeconds(): Int = when (workProfile) {
@@ -276,8 +295,40 @@ class ListeningService : LifecycleService() {
     private fun failCapture(message: String) {
         ListeningRuntime.update { it.copy(recoverableError = message) }
         running.set(false)
+        paused.set(false)
         recorder?.runCatching { stop() }
         lifecycleScope.launch { stopAndFlush() }
+    }
+
+    private fun pauseCapture() {
+        if (!running.get() || paused.get() || stopping.get()) return
+        paused.set(true)
+        recorder?.runCatching { stop() }
+        abandonAudioFocus()
+        ListeningRuntime.update { it.copy(paused = true, audioLevel = 0f, recoverableError = null) }
+        promoteToForeground("Paused")
+    }
+
+    private fun resumeCapture() {
+        if (!running.get() || !paused.get() || stopping.get()) return
+        if (!requestAudioFocus()) {
+            ListeningRuntime.update {
+                it.copy(paused = true, audioLevel = 0f, recoverableError = "Microphone could not be reacquired. Tap Resume to try again.")
+            }
+            promoteToForeground("Paused")
+            return
+        }
+        lifecycleScope.launch {
+            captureJob?.join()
+            if (running.get() && paused.get() && !stopping.get()) {
+                paused.set(false)
+                ListeningRuntime.update { it.copy(paused = false, recoverableError = null) }
+                promoteToForeground(foregroundStatus)
+                if (engine != null && sessionId != null) {
+                    captureJob = lifecycleScope.launch(Dispatchers.IO) { captureLoop() }
+                }
+            }
+        }
     }
 
     private fun containsSpeech(samples: ShortArray, count: Int): Boolean {
@@ -299,10 +350,12 @@ class ListeningService : LifecycleService() {
 
     private suspend fun stopAndFlush() {
         if (!stopping.compareAndSet(false, true)) return
-        ListeningRuntime.update { it.copy(stopping = true) }
+        paused.set(false)
+        ListeningRuntime.update { it.copy(paused = false, stopping = true) }
         if (!running.getAndSet(false) && captureJob == null) { stopSelf(); return }
         recorder?.runCatching { stop() }
         captureJob?.join()
+        windows.close()
         processingJob?.join()
         finishService()
     }
@@ -312,7 +365,7 @@ class ListeningService : LifecycleService() {
         (application as ListenerApplication).models.manager.markLoaded(null)
         abandonAudioFocus()
         ListeningRuntime.update {
-            it.copy(recording = false, modelLoading = false, stopping = false, activeModelId = null, audioLevel = 0f, provisionalTranscript = "")
+            it.copy(recording = false, paused = false, modelLoading = false, stopping = false, activeModelId = null, audioLevel = 0f, provisionalTranscript = "")
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
         stopSelf()
@@ -320,6 +373,7 @@ class ListeningService : LifecycleService() {
 
     override fun onDestroy() {
         running.set(false)
+        paused.set(false)
         engine?.cancel()
         recorder?.runCatching { stop() }
         (application as ListenerApplication).models.manager.markLoaded(null)
@@ -369,6 +423,8 @@ class ListeningService : LifecycleService() {
 
     companion object {
         const val ACTION_START = "com.listener.START"
+        const val ACTION_PAUSE = "com.listener.PAUSE"
+        const val ACTION_RESUME = "com.listener.RESUME"
         const val ACTION_STOP = "com.listener.STOP"
         const val EXTRA_MODEL_PATH = "model_path"
         const val EXTRA_MODEL_ID = "model_id"

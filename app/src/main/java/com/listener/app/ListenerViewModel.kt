@@ -129,6 +129,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
     private var lastSentTranscript = ""
     private val summaryGate = SummaryRequestGate()
     private val summaryRateLimitBackoff = SummaryRateLimitBackoff()
+    private val groqSummaryTokenBudget = SummaryTokenBudgetTracker()
     private val summaryDebugTrace = SummaryDebugTrace(File(app.filesDir, "summary-debug-traces"))
 
     private val local = combine(
@@ -215,11 +216,13 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                             "apiKeyPresent" to remoteApiKeyPresent(preferences.selectedModel).yesNo(),
                         ),
                     )
-                    delay(FIRST_SUMMARY_DELAY_MS)
+                    delayActiveListeningMillis(FIRST_SUMMARY_DELAY_MS)
+                    waitForResumeBeforeSummary(preferences)
                     launch { sendSummaryIfNeeded(app.preferences.values.first()) }
                     while (currentCoroutineContext().isActive) {
                         val preferences = app.preferences.values.first()
-                        delay(adaptiveSummaryCadenceMillis(ListeningRuntime.state.value.elapsedSeconds).toLong())
+                        delayActiveListeningMillis(adaptiveSummaryCadenceMillis(ListeningRuntime.state.value.elapsedSeconds).toLong())
+                        waitForResumeBeforeSummary(preferences)
                         launch { sendSummaryIfNeeded(preferences) }
                     }
                 }
@@ -314,6 +317,29 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             putExtra(ListeningService.EXTRA_WORK_PROFILE, preferences.whisperWorkProfile.id)
             putExtra(ListeningService.EXTRA_BACKEND, InferenceBackend.CPU_FALLBACK.name)
         })
+    }
+
+    fun pauseOrResumeRecording(context: Context) {
+        val runtime = ListeningRuntime.state.value
+        if (!runtime.recording || runtime.stopping) return
+        val service = if (runtime.backend == InferenceBackend.ANDROID_ON_DEVICE) {
+            PlatformSpeechService::class.java
+        } else {
+            ListeningService::class.java
+        }
+        val action = when {
+            service == PlatformSpeechService::class.java && runtime.paused -> PlatformSpeechService.ACTION_RESUME
+            service == PlatformSpeechService::class.java -> PlatformSpeechService.ACTION_PAUSE
+            runtime.paused -> ListeningService.ACTION_RESUME
+            else -> ListeningService.ACTION_PAUSE
+        }
+        val preferences = uiState.value.preferences
+        summaryDebugTrace.append(
+            sessionId = runtime.sessionId,
+            label = if (runtime.paused) "resume_recording_requested" else "pause_recording_requested",
+            fields = summaryTraceFields(preferences, runtime),
+        )
+        context.startService(Intent(context, service).setAction(action))
     }
 
     fun stopRecording(context: Context) {
@@ -464,9 +490,40 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
     private fun remoteProviderName(modelId: String): String =
         if (modelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "Groq" else "OpenRouter"
 
+    private suspend fun delayActiveListeningMillis(durationMillis: Long) {
+        var remaining = durationMillis
+        while (remaining > 0 && ListeningRuntime.state.value.recording && currentCoroutineContext().isActive) {
+            val step = minOf(remaining, PAUSE_AWARE_DELAY_STEP_MS)
+            delay(step)
+            if (!ListeningRuntime.state.value.paused) remaining -= step
+        }
+    }
+
+    private suspend fun waitForResumeBeforeSummary(preferences: ListenerPreferences) {
+        while (ListeningRuntime.state.value.recording && ListeningRuntime.state.value.paused && currentCoroutineContext().isActive) {
+            val runtime = ListeningRuntime.state.value
+            summaryDiagnostics.updateTrace("Paused", adaptiveSummaryCadenceMillis(runtime.elapsedSeconds))
+            summaryDebugTrace.append(
+                sessionId = runtime.sessionId,
+                label = "summary_attempt_skipped",
+                fields = summaryTraceFields(preferences, runtime) + mapOf("reason" to "listening_paused"),
+            )
+            ListeningRuntime.state.first { !it.recording || !it.paused }
+        }
+    }
+
     private suspend fun sendSummaryIfNeeded(preferences: ListenerPreferences) {
         val runtime = ListeningRuntime.state.value
         val cadenceMillis = adaptiveSummaryCadenceMillis(runtime.elapsedSeconds)
+        if (!summaryRequestAllowed(runtime)) {
+            summaryDiagnostics.updateTrace("Paused", cadenceMillis)
+            summaryDebugTrace.append(
+                sessionId = runtime.sessionId,
+                label = "summary_attempt_skipped",
+                fields = summaryTraceFields(preferences, runtime) + mapOf("reason" to "listening_paused"),
+            )
+            return
+        }
         if (!summaryGate.tryStart()) {
             summaryDiagnostics.updateTrace("Summary in flight", cadenceMillis)
             summaryDebugTrace.append(
@@ -605,8 +662,9 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             )
             return
         }
-        val promptInputs = summaryPromptInputs(transcript, lastSentTranscript, streamingContext.value.current)
+        val promptInputs = summaryPromptInputs(transcript, lastSentTranscript, streamingContext.value.current, resolvedModel)
         val newText = promptInputs.fullDelta
+        val estimatedGroqRequestTokens = promptInputs.estimatedGroqRequestTokens
         summaryDebugTrace.append(
             sessionId = runtime.sessionId,
             label = "summary_prompt_prepared",
@@ -617,9 +675,56 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 "sentChineseContinuityTailChars" to promptInputs.chineseContinuityTail.length.toString(),
                 "sentPreviousEnglishSummaryChars" to promptInputs.previousEnglishSummary.length.toString(),
                 "deltaWasTrimmedToCap" to (promptInputs.newChineseDelta.length < newText.length).yesNo(),
+                "coveredTranscriptCharsAfterSuccess" to promptInputs.coveredTranscript.length.toString(),
+                "estimatedGroqRequestTokens" to (estimatedGroqRequestTokens?.toString() ?: "none"),
                 "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
             ),
         )
+        if (!summaryRequestAllowed(ListeningRuntime.state.value)) {
+            summaryDiagnostics.updateTrace("Paused", cadenceMillis, resolvedModel, transcript.length, newText.length)
+            summaryDebugTrace.append(
+                sessionId = runtime.sessionId,
+                label = "summary_attempt_skipped",
+                fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
+                    "reason" to "listening_paused",
+                    "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
+                ),
+            )
+            return
+        }
+        if (estimatedGroqRequestTokens != null) {
+            groqSummaryTokenBudget.cooldownFor(estimatedGroqRequestTokens)?.let { cooldown ->
+                val now = System.currentTimeMillis()
+                summaryDiagnostics.update { current ->
+                    current.copy(
+                        phase = "Groq token budget cooldown",
+                        modelId = resolvedModel,
+                        cadenceMillis = cadenceMillis,
+                        transcriptChars = transcript.length,
+                        deltaChars = newText.length,
+                        finalAtMillis = now,
+                        error = "Groq token budget is cooling down before the next summary request.",
+                        events = current.events.plus(
+                            SummaryTraceEvent(now, "Groq token budget cooldown: ${cooldown.remainingMillis}ms remaining")
+                        ).takeLast(MAX_SUMMARY_EVENTS),
+                    )
+                }
+                summaryDebugTrace.append(
+                    sessionId = runtime.sessionId,
+                    label = "summary_attempt_skipped",
+                    fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
+                        "reason" to "groq_token_budget_cooldown",
+                        "estimatedGroqRequestTokens" to estimatedGroqRequestTokens.toString(),
+                        "tokenBudgetLimitTokens" to cooldown.limitTokens.toString(),
+                        "tokenBudgetUsedTokens" to cooldown.usedTokens.toString(),
+                        "tokenBudgetRemainingTokens" to cooldown.remainingTokens.toString(),
+                        "cooldownRemainingMs" to cooldown.remainingMillis.toString(),
+                        "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
+                    ),
+                )
+                return
+            }
+        }
         val transcriptReadyAt = System.currentTimeMillis()
         summaryDiagnostics.value = SummaryDiagnostics(
             phase = "Transcript ready",
@@ -645,6 +750,9 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
             )
         }
         Log.d(SUMMARY_LOG_TAG, "request_start=$requestStartAt after_transcript_ready_ms=${requestStartAt - transcriptReadyAt}")
+        if (estimatedGroqRequestTokens != null) {
+            groqSummaryTokenBudget.recordRequest(estimatedGroqRequestTokens, requestStartAt)
+        }
         summaryDebugTrace.append(
             sessionId = runtime.sessionId,
             label = if (resolvedModel == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) "groq_request_started" else "openrouter_request_started",
@@ -653,6 +761,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 "effectiveModel" to resolvedModel,
                 "remoteProvider" to remoteProviderName(resolvedModel),
                 "fallbackAttempted" to false.yesNo(),
+                "estimatedGroqRequestTokens" to (estimatedGroqRequestTokens?.toString() ?: "none"),
                 "requestDelayAfterTranscriptReadyMs" to (requestStartAt - transcriptReadyAt).toString(),
             ),
         )
@@ -702,7 +811,8 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
         val remoteAttempt = if (
             firstResult is RemoteResult.Failure &&
             shouldRetrySummaryWithFreeRouter(resolvedModel, firstResult) &&
-            fallbackOpenRouterKey != null
+            fallbackOpenRouterKey != null &&
+            summaryRequestAllowed(ListeningRuntime.state.value)
         ) {
             val fallbackStartAt = System.currentTimeMillis()
             summaryDiagnostics.update { current ->
@@ -734,6 +844,21 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 fallbackResult = fallbackResult.summaryTraceResult(),
             )
         } else {
+            if (firstResult is RemoteResult.Failure &&
+                shouldRetrySummaryWithFreeRouter(resolvedModel, firstResult) &&
+                fallbackOpenRouterKey != null &&
+                !summaryRequestAllowed(ListeningRuntime.state.value)
+            ) {
+                summaryDebugTrace.append(
+                    sessionId = runtime.sessionId,
+                    label = "summary_attempt_skipped",
+                    fields = summaryTraceFields(preferences, ListeningRuntime.state.value) + mapOf(
+                        "reason" to "listening_paused",
+                        "blockedRequest" to "openrouter_fallback",
+                        "lastSentTranscriptChars" to lastSentTranscript.length.toString(),
+                    ),
+                )
+            }
             SummaryRemoteAttempt(
                 result = firstResult,
                 effectiveModel = resolvedModel,
@@ -768,7 +893,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                 remoteStatus.value = RemoteStatus.Ready
                 remoteMessage.value = null
                 summaryRateLimitBackoff.clear(remoteAttempt.effectiveModel)
-                lastSentTranscript = transcript
+                lastSentTranscript = promptInputs.coveredTranscript
                 if (remoteAttempt.fallbackAttempted) app.preferences.setSelectedModel(OPENROUTER_FREE_ROUTER_MODEL_ID)
                 if (commit.changed) runtime.sessionId?.let { app.sessions.appendSummary(it, result.value) }
                 summaryDebugTrace.append(
@@ -787,6 +912,7 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                         "sessionSummaryPersisted" to commit.changed.yesNo(),
                         "lastSentTranscriptAdvanced" to true.yesNo(),
                         "lastSentTranscriptCharsAfterCommit" to lastSentTranscript.length.toString(),
+                        "coveredTranscriptCharsAfterSuccess" to promptInputs.coveredTranscript.length.toString(),
                     ),
                 )
             }
@@ -827,7 +953,13 @@ class ListenerViewModel(application: Application) : AndroidViewModel(application
                     remoteStatus.value = result.status
                     remoteMessage.value = result.message
                     if (result.status == RemoteStatus.RateLimited) {
-                        val cooldown = summaryRateLimitBackoff.recordFailure(remoteAttempt.effectiveModel, result.diagnostics, failedAt)
+                        groqSummaryTokenBudget.updateFromRateLimit(result.diagnostics)
+                        val cooldown = summaryRateLimitBackoff.recordFailure(
+                            modelId = remoteAttempt.effectiveModel,
+                            diagnostics = result.diagnostics,
+                            failedAtMillis = failedAt,
+                            estimatedRequestTokens = estimatedGroqRequestTokens,
+                        )
                         summaryDebugTrace.append(
                             sessionId = runtime.sessionId,
                             label = "summary_rate_limit_cooldown_started",
@@ -855,6 +987,8 @@ internal fun ListeningContext?.toPromptContext(): String {
 }
 
 internal fun ListenerRuntimeState.finalizedTranscriptForSummary(): String = stableTranscript
+
+internal fun summaryRequestAllowed(runtime: ListenerRuntimeState): Boolean = !runtime.paused
 
 internal fun ListeningContext?.toPromptJson(): String {
     val context = this ?: return ""
@@ -899,25 +1033,83 @@ internal data class SummaryPromptInputs(
     val chineseContinuityTail: String,
     val newChineseDelta: String,
     val fullDelta: String,
+    val coveredTranscript: String,
+    val estimatedGroqRequestTokens: Int?,
 )
 
 internal fun summaryPromptInputs(
     transcript: String,
     lastSentTranscript: String,
     currentContext: ListeningContext?,
+    modelId: String? = null,
 ): SummaryPromptInputs {
+    val profile = summaryPromptProfile(modelId)
     val fullDelta = transcript.deltaSince(lastSentTranscript)
+    val hasPrefix = transcript.startsWith(lastSentTranscript)
+    val newChineseDelta = fullDelta.take(profile.chineseDeltaChars)
+    val coveredTranscript = if (hasPrefix && newChineseDelta.length < fullDelta.length) {
+        lastSentTranscript + newChineseDelta
+    } else {
+        transcript
+    }
+    val previousEnglishSummary = currentContext.toPromptJson().takeLast(profile.previousEnglishSummaryChars)
+    val chineseContinuityTail = if (hasPrefix) {
+        lastSentTranscript.takeLast(profile.chineseContinuityTailChars)
+    } else {
+        ""
+    }
     return SummaryPromptInputs(
-        previousEnglishSummary = currentContext.toPromptJson().takeLast(PREVIOUS_SUMMARY_PROMPT_CHARS),
-        chineseContinuityTail = if (transcript.startsWith(lastSentTranscript)) {
-            lastSentTranscript.takeLast(CHINESE_CONTINUITY_TAIL_CHARS)
-        } else {
-            ""
-        },
-        newChineseDelta = fullDelta.takeLast(CHINESE_DELTA_PROMPT_CHARS),
+        previousEnglishSummary = previousEnglishSummary,
+        chineseContinuityTail = chineseContinuityTail,
+        newChineseDelta = newChineseDelta,
         fullDelta = fullDelta,
+        coveredTranscript = coveredTranscript,
+        estimatedGroqRequestTokens = if (modelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+            estimateGroqSummaryRequestTokens(
+                previousEnglishSummary = previousEnglishSummary,
+                chineseContinuityTail = chineseContinuityTail,
+                newChineseDelta = newChineseDelta,
+            )
+        } else {
+            null
+        },
     )
 }
+
+internal data class SummaryPromptProfile(
+    val previousEnglishSummaryChars: Int,
+    val chineseDeltaChars: Int,
+    val chineseContinuityTailChars: Int,
+)
+
+internal fun summaryPromptProfile(modelId: String?): SummaryPromptProfile =
+    if (modelId == GROQ_GPT_OSS_20B_REMOTE_MODEL_ID) {
+        SummaryPromptProfile(
+            previousEnglishSummaryChars = GROQ_PREVIOUS_SUMMARY_PROMPT_CHARS,
+            chineseDeltaChars = GROQ_CHINESE_DELTA_PROMPT_CHARS,
+            chineseContinuityTailChars = GROQ_CHINESE_CONTINUITY_TAIL_CHARS,
+        )
+    } else {
+        SummaryPromptProfile(
+            previousEnglishSummaryChars = PREVIOUS_SUMMARY_PROMPT_CHARS,
+            chineseDeltaChars = CHINESE_DELTA_PROMPT_CHARS,
+            chineseContinuityTailChars = CHINESE_CONTINUITY_TAIL_CHARS,
+        )
+    }
+
+internal fun estimateGroqSummaryRequestTokens(
+    previousEnglishSummary: String,
+    chineseContinuityTail: String,
+    newChineseDelta: String,
+): Int =
+    GROQ_SUMMARY_FIXED_PROMPT_TOKENS +
+        chineseContinuityTail.length +
+        newChineseDelta.length +
+        previousEnglishSummary.estimatedEnglishTokens() +
+        GROQ_SUMMARY_MAX_COMPLETION_TOKENS
+
+private fun String.estimatedEnglishTokens(): Int =
+    (length + ESTIMATED_ENGLISH_CHARS_PER_TOKEN - 1) / ESTIMATED_ENGLISH_CHARS_PER_TOKEN
 
 internal fun shouldRetrySummaryWithFreeRouter(model: String, failure: RemoteResult.Failure): Boolean =
     model != OPENROUTER_FREE_ROUTER_MODEL_ID &&
@@ -1002,11 +1194,13 @@ internal class SummaryRateLimitBackoff(
         modelId: String,
         diagnostics: RemoteFailureDiagnostics?,
         atMillis: Long = clock(),
+        failedAtMillis: Long = atMillis,
+        estimatedRequestTokens: Int? = null,
     ): SummaryRateLimitCooldown {
-        val decision = rateLimitCooldownDecision(diagnostics)
+        val decision = rateLimitCooldownDecision(diagnostics, estimatedRequestTokens)
         val cooldown = SummaryRateLimitCooldown(
             modelId = modelId,
-            untilMillis = atMillis + decision.durationMillis,
+            untilMillis = failedAtMillis + decision.durationMillis,
             durationMillis = decision.durationMillis,
             source = decision.source,
         )
@@ -1028,21 +1222,43 @@ internal data class RateLimitCooldownDecision(
     val source: String,
 )
 
-internal fun rateLimitCooldownDecision(diagnostics: RemoteFailureDiagnostics?): RateLimitCooldownDecision {
+internal fun rateLimitCooldownDecision(
+    diagnostics: RemoteFailureDiagnostics?,
+    estimatedRequestTokens: Int? = null,
+): RateLimitCooldownDecision {
     val retryAfterMs = diagnostics?.retryAfterSeconds.parseRateLimitDurationMillis()
+    val requestResetMs = diagnostics?.rateLimitResetRequests
+        .takeIf { diagnostics?.rateLimitRemainingRequests.isZeroRateLimitRemaining() }
+        .parseRateLimitDurationMillis()
+    val remainingTokens = diagnostics?.rateLimitRemainingTokens.parseRateLimitTokenCount()
+    val tokenResetNeeded = remainingTokens != null &&
+        (remainingTokens <= 0 || (estimatedRequestTokens != null && remainingTokens < estimatedRequestTokens))
+    val tokenResetMs = diagnostics?.rateLimitResetTokens
+        .takeIf { tokenResetNeeded }
+        .parseRateLimitDurationMillis()
+    val resetMs = listOfNotNull(requestResetMs, tokenResetMs).maxOrNull()
+    if (retryAfterMs != null && resetMs == null) {
+        return RateLimitCooldownDecision(
+            durationMillis = retryAfterMs.clampRateLimitCooldown(),
+            source = "retry-after",
+        )
+    }
+    if (retryAfterMs != null && tokenResetNeeded && resetMs != null) {
+        return RateLimitCooldownDecision(
+            durationMillis = maxOf(retryAfterMs, resetMs).clampRateLimitCooldown(),
+            source = when {
+                requestResetMs != null && tokenResetMs != null -> "retry-after-and-ratelimit-reset-requests-and-tokens"
+                requestResetMs != null -> "retry-after-and-ratelimit-reset-requests"
+                else -> "retry-after-and-ratelimit-reset-tokens"
+            },
+        )
+    }
     if (retryAfterMs != null) {
         return RateLimitCooldownDecision(
             durationMillis = retryAfterMs.clampRateLimitCooldown(),
             source = "retry-after",
         )
     }
-    val requestResetMs = diagnostics?.rateLimitResetRequests
-        .takeIf { diagnostics?.rateLimitRemainingRequests.isZeroRateLimitRemaining() }
-        .parseRateLimitDurationMillis()
-    val tokenResetMs = diagnostics?.rateLimitResetTokens
-        .takeIf { diagnostics?.rateLimitRemainingTokens.isZeroRateLimitRemaining() }
-        .parseRateLimitDurationMillis()
-    val resetMs = listOfNotNull(requestResetMs, tokenResetMs).maxOrNull()
     if (resetMs != null) {
         return RateLimitCooldownDecision(
             durationMillis = resetMs.clampRateLimitCooldown(),
@@ -1081,8 +1297,58 @@ internal fun String?.parseRateLimitDurationMillis(): Long? {
 private fun String?.isZeroRateLimitRemaining(): Boolean =
     this?.trim()?.toDoubleOrNull()?.let { it <= 0.0 } == true
 
+private fun String?.parseRateLimitTokenCount(): Int? =
+    this?.trim()?.toDoubleOrNull()?.toInt()
+
 private fun Long.clampRateLimitCooldown(): Long =
     coerceIn(MIN_RATE_LIMIT_COOLDOWN_MS, MAX_RATE_LIMIT_COOLDOWN_MS)
+
+internal data class SummaryTokenBudgetCooldown(
+    val remainingMillis: Long,
+    val usedTokens: Int,
+    val remainingTokens: Int,
+    val limitTokens: Int,
+)
+
+internal class SummaryTokenBudgetTracker(
+    private val clock: () -> Long = System::currentTimeMillis,
+    private val windowMillis: Long = GROQ_SUMMARY_TOKEN_WINDOW_MS,
+    initialLimitTokens: Int = GROQ_SUMMARY_TPM_LIMIT_TOKENS,
+    private val reserveTokens: Int = GROQ_SUMMARY_TOKEN_RESERVE,
+) {
+    private data class Entry(val atMillis: Long, val tokens: Int)
+
+    private val requests = mutableListOf<Entry>()
+    private var limitTokens = initialLimitTokens
+
+    fun recordRequest(tokens: Int, atMillis: Long = clock()) {
+        prune(atMillis)
+        requests += Entry(atMillis, tokens.coerceAtLeast(0))
+    }
+
+    fun cooldownFor(estimatedTokens: Int, atMillis: Long = clock()): SummaryTokenBudgetCooldown? {
+        prune(atMillis)
+        val used = requests.sumOf { it.tokens }
+        val usableLimit = (limitTokens - reserveTokens).coerceAtLeast(0)
+        if (used + estimatedTokens <= usableLimit) return null
+        val oldest = requests.minByOrNull { it.atMillis } ?: return null
+        return SummaryTokenBudgetCooldown(
+            remainingMillis = (oldest.atMillis + windowMillis - atMillis).coerceAtLeast(0L),
+            usedTokens = used,
+            remainingTokens = (usableLimit - used).coerceAtLeast(0),
+            limitTokens = limitTokens,
+        )
+    }
+
+    fun updateFromRateLimit(diagnostics: RemoteFailureDiagnostics?) {
+        val providerLimit = diagnostics?.rateLimitLimitTokens.parseRateLimitTokenCount() ?: return
+        if (providerLimit > 0) limitTokens = providerLimit
+    }
+
+    private fun prune(now: Long) {
+        requests.removeAll { it.atMillis + windowMillis <= now }
+    }
+}
 
 internal class SummaryRequestGate {
     private val inFlight = AtomicBoolean(false)
@@ -1174,7 +1440,7 @@ internal fun buildDetailedSummaryTrace(
     appendLine()
     appendLine("How to read this")
     appendLine("- If the Chinese transcript is good but English is missing, look for summary_attempt_skipped or summary_response_failed lines.")
-    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_groq_key, missing_remote_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent, stable_transcript_delta_below_minimum, remote_rate_limit_cooldown.")
+    appendLine("- Common skip reasons: remote_summaries_disabled, missing_openrouter_key, missing_groq_key, missing_remote_model, stable_transcript_empty, stable_transcript_unchanged_since_last_sent, stable_transcript_delta_below_minimum, remote_rate_limit_cooldown, groq_token_budget_cooldown, listening_paused.")
     appendLine("- cadenceMillis is the active adaptive cadence; configuredCadenceMillis is the stored preference for comparison.")
     appendLine("- InvalidResponse means the selected remote provider replied, but the app could not parse valid JSON, so the previous context was kept and lastSentTranscript was not advanced.")
     appendLine("- RateLimited lines include safe request/token limit headers when the provider returns them. A following remote_rate_limit_cooldown skip means transcript capture continued while remote summary retries paused.")
@@ -1199,6 +1465,7 @@ internal fun summaryTraceFields(preferences: ListenerPreferences, runtime: Liste
     return mapOf(
         "sessionId" to (runtime.sessionId?.toString() ?: "none"),
         "recording" to runtime.recording.yesNo(),
+        "paused" to runtime.paused.yesNo(),
         "stopping" to runtime.stopping.yesNo(),
         "engine" to preferences.transcriptionEngine.id,
         "backend" to (runtime.backend?.name ?: "none"),
@@ -1267,11 +1534,20 @@ internal fun adaptiveSummaryCadencePhase(elapsedSeconds: Long): String = when {
 }
 
 private const val FIRST_SUMMARY_DELAY_MS = 2_000L
+private const val PAUSE_AWARE_DELAY_STEP_MS = 200L
 private const val MAX_CONTEXT_HISTORY = 30
 private const val MAX_SUMMARY_EVENTS = 6
 private const val PREVIOUS_SUMMARY_PROMPT_CHARS = 2_000
 private const val CHINESE_DELTA_PROMPT_CHARS = 2_000
 private const val CHINESE_CONTINUITY_TAIL_CHARS = 800
+private const val GROQ_PREVIOUS_SUMMARY_PROMPT_CHARS = 240
+private const val GROQ_CHINESE_DELTA_PROMPT_CHARS = 800
+private const val GROQ_CHINESE_CONTINUITY_TAIL_CHARS = 160
+private const val GROQ_SUMMARY_FIXED_PROMPT_TOKENS = 900
+private const val ESTIMATED_ENGLISH_CHARS_PER_TOKEN = 4
+private const val GROQ_SUMMARY_TPM_LIMIT_TOKENS = 8_000
+private const val GROQ_SUMMARY_TOKEN_RESERVE = 500
+private const val GROQ_SUMMARY_TOKEN_WINDOW_MS = 60_000L
 internal const val MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS = 3
 internal const val ADAPTIVE_SUMMARY_WARMUP_CADENCE_MILLIS = 5_000
 internal const val ADAPTIVE_SUMMARY_MIDDLE_CADENCE_MILLIS = 8_000

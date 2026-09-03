@@ -40,6 +40,8 @@ Use the brief output first. Use `--full` only when the brief points to a timing,
 
 If the app pauses retries after one of these failures, the runtime log will show `summary_rate_limit_cooldown_started`, followed by `summary_attempt_skipped reason=remote_rate_limit_cooldown` while local transcript capture continues.
 
+`summary_attempt_skipped reason=groq_token_budget_cooldown` means the app did not call Groq because its local rolling token estimate says the next request would exceed the current Groq tokens-per-minute window. Finalized Chinese remains pending and should be sent in a bounded chunk after the token window clears.
+
 ## Delta Guard Traces
 
 `summary_attempt_skipped reason=stable_transcript_delta_below_minimum` means remote summaries were otherwise ready, but fewer than three new finalized Chinese characters were pending. `lastSentTranscript` is not advanced on this skip, so the tiny delta accumulates into the next eligible request.

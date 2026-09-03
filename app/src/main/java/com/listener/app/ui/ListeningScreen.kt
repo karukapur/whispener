@@ -102,10 +102,22 @@ private enum class Destination(val route: String, val label: String, @DrawableRe
 @Composable fun ListenerApp(viewModel: ListenerViewModel) {
     val state by viewModel.uiState.collectAsState()
     val context = LocalContext.current
-    KeepScreenAwake(state.runtime.recording)
+    KeepScreenAwake(state.runtime.recording && !state.runtime.paused)
     val permissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { grants ->
         if (grants[Manifest.permission.RECORD_AUDIO] == true) viewModel.startRecording(context)
         else com.listener.app.audio.ListeningRuntime.update { it.copy(recoverableError = "Microphone permission is required to transcribe speech.") }
+    }
+    val startListening = {
+        if (state.isMissingRequiredLocalModel()) {
+            viewModel.startRecording(context)
+        } else {
+            val required = buildList {
+                add(Manifest.permission.RECORD_AUDIO)
+                if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
+            }.toTypedArray()
+            val missing = required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
+            if (missing) permissionLauncher.launch(required) else viewModel.startRecording(context)
+        }
     }
     ListenerTheme {
         Surface(Modifier.fillMaxSize()) {
@@ -113,20 +125,13 @@ private enum class Destination(val route: String, val label: String, @DrawableRe
                 if (!state.preferences.onboardingComplete) {
                     PrivacyOnboarding { remote, retention -> viewModel.completeOnboarding(remote, retention) }
                 } else {
-                    ListenerNavigation(state, viewModel) {
-                        if (state.runtime.recording) viewModel.stopRecording(context) else {
-                            if (state.isMissingRequiredLocalModel()) {
-                                viewModel.startRecording(context)
-                                return@ListenerNavigation
-                            }
-                            val required = buildList {
-                                add(Manifest.permission.RECORD_AUDIO)
-                                if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-                            }.toTypedArray()
-                            val missing = required.any { ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED }
-                            if (missing) permissionLauncher.launch(required) else viewModel.startRecording(context)
-                        }
-                    }
+                    ListenerNavigation(
+                        state = state,
+                        viewModel = viewModel,
+                        startRecording = startListening,
+                        pauseOrResumeRecording = { viewModel.pauseOrResumeRecording(context) },
+                        stopRecording = { viewModel.stopRecording(context) },
+                    )
                 }
             }
         }
@@ -162,7 +167,13 @@ private fun ListenerUiState.isMissingRequiredLocalModel(): Boolean {
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun ListenerNavigation(state: ListenerUiState, viewModel: ListenerViewModel, toggleRecording: () -> Unit) {
+@Composable private fun ListenerNavigation(
+    state: ListenerUiState,
+    viewModel: ListenerViewModel,
+    startRecording: () -> Unit,
+    pauseOrResumeRecording: () -> Unit,
+    stopRecording: () -> Unit,
+) {
     val navController = rememberNavController()
     var selected by rememberSaveable { mutableStateOf(Destination.Listen) }
     Scaffold(
@@ -210,10 +221,13 @@ private fun ListenerUiState.isMissingRequiredLocalModel(): Boolean {
                 }
                 ListeningScreen(
                     recording = state.runtime.recording,
+                    paused = state.runtime.paused,
                     elapsedSeconds = state.runtime.elapsedSeconds,
                     intervalMillis = state.preferences.summaryCadenceMillis,
                     onIntervalChange = viewModel::setCadenceMillis,
-                    onToggle = toggleRecording,
+                    onStart = startRecording,
+                    onPauseResume = pauseOrResumeRecording,
+                    onStop = stopRecording,
                     contextState = state.streamingContext,
                     summaryDiagnostics = state.summaryDiagnostics,
                     remoteMessage = state.remoteMessage,
@@ -333,6 +347,7 @@ private const val TabSlideMillis = 180
 private const val TabSlideDistanceDivisor = 18
 private const val ListenTitle = "Listen"
 private const val ListeningTitle = "Listening"
+private const val PausedTitle = "Paused"
 private const val ListeningTypewriterDelayMillis = 140L
 private const val RecordingBreathMillis = 1_400
 private val RecordingRedDark = Color(0xFFC62828)
@@ -343,7 +358,10 @@ private val RecordingRedBright = Color(0xFFFF5252)
     elapsedSeconds: Long,
     intervalMillis: Int,
     onIntervalChange: (Int) -> Unit,
-    onToggle: () -> Unit,
+    onStart: () -> Unit,
+    onPauseResume: () -> Unit = {},
+    onStop: () -> Unit = {},
+    paused: Boolean = false,
     globalContext: String = "",
     details: List<String> = emptyList(),
     contextState: StreamingContextState? = null,
@@ -380,7 +398,7 @@ private val RecordingRedBright = Color(0xFFFF5252)
         val maxWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
         val maxHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.Small)) {
-            ListeningScreenTitle(recording)
+            ListeningScreenTitle(recording, paused)
             if (wide) {
                 Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     ContextCard(
@@ -389,7 +407,7 @@ private val RecordingRedBright = Color(0xFFFF5252)
                         remoteStatus = remoteStatus,
                         remoteMessage = remoteMessage,
                         emptyMessage = emptyContextMessage,
-                        orbActive = recording || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
+                        orbActive = (recording && !paused) || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
                         showIdleSphere = !recording && !modelLoading && !stopping,
                         animateIdleSphere = animateIdleSphere,
                         modifier = Modifier.weight(contextRatio).fillMaxHeight(),
@@ -408,7 +426,7 @@ private val RecordingRedBright = Color(0xFFFF5252)
                     remoteStatus = remoteStatus,
                     remoteMessage = remoteMessage,
                     emptyMessage = emptyContextMessage,
-                    orbActive = recording || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
+                    orbActive = (recording && !paused) || resolvedContextState.isStreaming || summaryDiagnostics.isEnglishContextInFlight(),
                     showIdleSphere = !recording && !modelLoading && !stopping,
                     animateIdleSphere = animateIdleSphere,
                     modifier = Modifier.weight(contextRatio).fillMaxWidth(),
@@ -422,30 +440,45 @@ private val RecordingRedBright = Color(0xFFFF5252)
             }
             Controls(
                 recording = recording,
+                paused = paused,
                 recordingAvailable = recordingAvailable,
                 modelLoading = modelLoading,
                 stopping = stopping,
-                toggle = onToggle,
+                onStart = onStart,
+                onPauseResume = onPauseResume,
+                onStop = onStop,
             )
         }
     }
 }
 
-@Composable private fun ListeningScreenTitle(recording: Boolean) {
+@Composable private fun ListeningScreenTitle(recording: Boolean, paused: Boolean) {
     val motionEnabled = remember {
         Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ValueAnimator.areAnimatorsEnabled()
     }
-    var title by remember { mutableStateOf(if (recording && !motionEnabled) ListeningTitle else ListenTitle) }
+    var title by remember { mutableStateOf(if (paused) PausedTitle else if (recording && !motionEnabled) ListeningTitle else ListenTitle) }
 
-    LaunchedEffect(recording, motionEnabled) {
+    LaunchedEffect(recording, paused, motionEnabled) {
         if (!motionEnabled) {
-            title = if (recording) ListeningTitle else ListenTitle
+            title = when {
+                paused -> PausedTitle
+                recording -> ListeningTitle
+                else -> ListenTitle
+            }
+        } else if (paused) {
+            title = PausedTitle
         } else if (recording) {
+            if (!ListeningTitle.startsWith(title)) {
+                title = ListenTitle
+            }
             ListeningTitle.drop(title.length).forEach { character ->
                 delay(ListeningTypewriterDelayMillis)
                 title += character
             }
         } else {
+            if (!title.startsWith(ListenTitle)) {
+                title = ListenTitle
+            }
             while (title.length > ListenTitle.length) {
                 delay(ListeningTypewriterDelayMillis)
                 title = title.dropLast(1)
@@ -456,11 +489,15 @@ private val RecordingRedBright = Color(0xFFFF5252)
     Text(
         title,
         style = MaterialTheme.typography.headlineMedium,
-        color = if (recording) breathingRecordingColor(motionEnabled) else MaterialTheme.colorScheme.onBackground,
+        color = if (recording && !paused) breathingRecordingColor(motionEnabled) else MaterialTheme.colorScheme.onBackground,
         modifier = Modifier
             .padding(start = ListenerSpacing.Small, bottom = ListenerSpacing.Small)
             .semantics {
-                contentDescription = if (recording) "Listening, recording active" else ListenTitle
+                contentDescription = when {
+                    paused -> PausedTitle
+                    recording -> "Listening, recording active"
+                    else -> ListenTitle
+                }
             }
             .testTag("listen-title"),
     )
@@ -1076,61 +1113,146 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
 
 @Composable private fun Controls(
     recording: Boolean,
+    paused: Boolean,
     recordingAvailable: Boolean,
     modelLoading: Boolean,
     stopping: Boolean,
-    toggle: () -> Unit,
+    onStart: () -> Unit,
+    onPauseResume: () -> Unit,
+    onStop: () -> Unit,
 ) {
     val actionCorner by animateDpAsState(
         targetValue = if (recording) 18.dp else 30.dp,
         animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
         label = "record action shape",
     )
-    val actionColor by animateColorAsState(
-        targetValue = if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+    val startColor by animateColorAsState(
+        targetValue = MaterialTheme.colorScheme.primary,
         animationSpec = tween(ListenerMotion.DefaultDurationMillis, easing = ListenerMotion.EmphasisEasing),
         label = "record action color",
     )
     val buttonEnabled = !stopping
     Column(Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).testTag("listening-controls")) {
-        Button(
-            enabled = buttonEnabled,
-            onClick = toggle,
-            modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).heightIn(min = 58.dp).testTag("record-toggle"),
-            shape = RoundedCornerShape(actionCorner),
-            colors = ButtonDefaults.buttonColors(
-                containerColor = if (recordingAvailable || recording || modelLoading) actionColor else MaterialTheme.colorScheme.surfaceContainerHighest,
-                contentColor = if (recordingAvailable || recording || modelLoading) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
-            ),
-        ) {
-            val action = when {
-                stopping -> "Finishing..."
-                modelLoading -> "Cancel"
-                recording -> "Stop listening"
-                recordingAvailable -> "Start listening"
-                else -> "Install model"
-            }
-            AnimatedContent(targetState = action, label = "record action") { label ->
+        AnimatedContent(targetState = recording, label = "record controls mode") { isRecording ->
+            if (isRecording) {
                 Row(
+                    Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).testTag("recording-controls-row"),
                     horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
-                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    if (modelLoading || stopping) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(18.dp).testTag("model-loading-indicator"),
-                            color = LocalContentColor.current,
-                            strokeWidth = 2.dp,
-                        )
-                    } else {
-                        Icon(
-                            painter = painterResource(R.drawable.ic_mic),
-                            contentDescription = null,
-                            modifier = Modifier.size(28.dp),
-                        )
+                    RecordingActionButton(
+                        label = if (paused) "Resume" else "Pause",
+                        icon = if (paused) R.drawable.ic_play else R.drawable.ic_pause,
+                        contentDescription = if (paused) "Resume listening" else "Pause listening",
+                        testTag = "record-pause-resume",
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        enabled = buttonEnabled,
+                        onClick = onPauseResume,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(actionCorner),
+                    )
+                    RecordingActionButton(
+                        label = if (stopping) "Finishing..." else "Stop",
+                        icon = R.drawable.ic_stop,
+                        contentDescription = "Stop listening",
+                        testTag = "record-stop",
+                        containerColor = MaterialTheme.colorScheme.error,
+                        contentColor = MaterialTheme.colorScheme.onError,
+                        enabled = buttonEnabled,
+                        onClick = onStop,
+                        modifier = Modifier.weight(1f),
+                        shape = RoundedCornerShape(actionCorner),
+                        showProgress = stopping,
+                    )
+                }
+            } else {
+                Button(
+                    enabled = buttonEnabled,
+                    onClick = onStart,
+                    modifier = Modifier.fillMaxWidth().padding(top = ListenerSpacing.ExtraSmall).heightIn(min = 58.dp).testTag("record-toggle"),
+                    shape = RoundedCornerShape(actionCorner),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (recordingAvailable || modelLoading) startColor else MaterialTheme.colorScheme.surfaceContainerHighest,
+                        contentColor = if (recordingAvailable || modelLoading) MaterialTheme.colorScheme.onPrimary else MaterialTheme.colorScheme.onSurfaceVariant,
+                    ),
+                ) {
+                    val action = when {
+                        stopping -> "Finishing..."
+                        modelLoading -> "Cancel"
+                        recordingAvailable -> "Start listening"
+                        else -> "Install model"
                     }
-                    Text(label, style = MaterialTheme.typography.titleMedium)
+                    AnimatedContent(targetState = action, label = "record action") { label ->
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            if (modelLoading || stopping) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp).testTag("model-loading-indicator"),
+                                    color = LocalContentColor.current,
+                                    strokeWidth = 2.dp,
+                                )
+                            } else {
+                                Icon(
+                                    painter = painterResource(R.drawable.ic_mic),
+                                    contentDescription = null,
+                                    modifier = Modifier.size(28.dp),
+                                )
+                            }
+                            Text(label, style = MaterialTheme.typography.titleMedium)
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+@Composable private fun RecordingActionButton(
+    label: String,
+    @DrawableRes icon: Int,
+    contentDescription: String,
+    testTag: String,
+    containerColor: Color,
+    contentColor: Color,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier,
+    shape: RoundedCornerShape,
+    showProgress: Boolean = false,
+) {
+    Button(
+        enabled = enabled,
+        onClick = onClick,
+        modifier = modifier
+            .heightIn(min = 58.dp)
+            .semantics { this.contentDescription = contentDescription }
+            .testTag(testTag),
+        shape = shape,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = containerColor,
+            contentColor = contentColor,
+        ),
+    ) {
+        Row(
+            horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.Small),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            if (showProgress) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp).testTag("stopping-indicator"),
+                    color = LocalContentColor.current,
+                    strokeWidth = 2.dp,
+                )
+            } else {
+                Icon(
+                    painter = painterResource(icon),
+                    contentDescription = null,
+                    modifier = Modifier.size(24.dp),
+                )
+            }
+            Text(label, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
     }
 }
@@ -1306,7 +1428,9 @@ private fun ListeningLightPreview() {
             elapsedSeconds = 0,
             intervalMillis = 2_500,
             onIntervalChange = {},
-            onToggle = {},
+            onStart = {},
+                onPauseResume = {},
+                onStop = {},
             contextState = previewContextState(),
             stableTranscript = "我們先確認明天早上九點在台北車站見面。",
             provisionalTranscript = "然後一起去",
@@ -1330,7 +1454,9 @@ private fun ListeningDarkPreview() {
             elapsedSeconds = 65,
             intervalMillis = 5_000,
             onIntervalChange = {},
-            onToggle = {},
+            onStart = {},
+                onPauseResume = {},
+                onStop = {},
             contextState = previewContextState(),
             stableTranscript = "我們先確認明天早上九點在台北車站見面。",
             provisionalTranscript = "然後一起去吃早餐。",
@@ -1358,7 +1484,9 @@ private fun ListeningLoadingPreview() {
             elapsedSeconds = 0,
             intervalMillis = 2_000,
             onIntervalChange = {},
-            onToggle = {},
+            onStart = {},
+                onPauseResume = {},
+                onStop = {},
             contextState = previewContextState().copy(
                 draft = ListeningContext("Adding travel details", listOf("Checking the meeting point")),
                 isStreaming = true,
@@ -1379,7 +1507,9 @@ private fun ListeningRemoteErrorPreview() {
             elapsedSeconds = 18,
             intervalMillis = 2_500,
             onIntervalChange = {},
-            onToggle = {},
+            onStart = {},
+                onPauseResume = {},
+                onStop = {},
             contextState = previewContextState(),
             stableTranscript = "明天早上九點在台北車站見面。",
             remoteStatus = RemoteStatus.ModelUnavailable,

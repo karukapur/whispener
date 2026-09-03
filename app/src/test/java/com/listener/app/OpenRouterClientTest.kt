@@ -90,7 +90,7 @@ class OpenRouterClientTest {
         assertTrue(body.contains("\"model\":\"openai/gpt-oss-20b\""))
         assertTrue(body.contains("\"stream\":false"))
         assertTrue(body.contains("\"strict\":true"))
-        assertTrue(body.contains("\"max_completion_tokens\":360"))
+        assertTrue(body.contains("\"max_completion_tokens\":$GROQ_SUMMARY_MAX_COMPLETION_TOKENS"))
         assertTrue(body.contains("\"reasoning_effort\":\"low\""))
         assertFalse(body.contains("\"provider\""))
     }

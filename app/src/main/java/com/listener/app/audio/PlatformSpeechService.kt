@@ -30,10 +30,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 class PlatformSpeechService : LifecycleService(), RecognitionListener {
     private val running = AtomicBoolean(false)
+    private val paused = AtomicBoolean(false)
+    private val stopping = AtomicBoolean(false)
     private val repository by lazy { SessionRepository(DatabaseProvider.get(this).sessions()) }
     private var recognizer: SpeechRecognizer? = null
     private var sessionId: Long? = null
     private var startedAtMs = 0L
+    private var pausedAtMs = 0L
+    private var totalPausedMs = 0L
     private var lastCommitMs = 0L
     private var restarting = false
     private var languageIndex = 0
@@ -44,6 +48,8 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
             ACTION_START -> if (running.compareAndSet(false, true)) startRecognizer(
                 intent.getIntExtra(EXTRA_CADENCE_SECONDS, 10),
             )
+            ACTION_PAUSE -> pauseRecognizer()
+            ACTION_RESUME -> resumeRecognizer()
             ACTION_STOP -> stopRecognizer()
         }
         return START_NOT_STICKY
@@ -69,27 +75,35 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
                 cadenceSeconds,
             )
             startedAtMs = System.currentTimeMillis()
+            pausedAtMs = 0L
+            totalPausedMs = 0L
             languageIndex = 0
+            paused.set(false)
+            stopping.set(false)
             (application as ListenerApplication).models.manager.markLoaded(ENGINE_ID)
             ListeningRuntime.update {
                 ListenerRuntimeState(
                     recording = true,
+                    paused = false,
                     activeModelId = ENGINE_ID,
                     backend = InferenceBackend.ANDROID_ON_DEVICE,
                     sessionId = sessionId,
                 )
             }
-            recognizer = if (Build.VERSION.SDK_INT >= 31) {
-                SpeechRecognizer.createOnDeviceSpeechRecognizer(this@PlatformSpeechService)
-            } else {
-                SpeechRecognizer.createSpeechRecognizer(this@PlatformSpeechService)
-            }.also { it.setRecognitionListener(this@PlatformSpeechService) }
+            recognizer = createRecognizer()
             listen()
         }
     }
 
+    private fun createRecognizer(): SpeechRecognizer =
+        if (Build.VERSION.SDK_INT >= 31) {
+            SpeechRecognizer.createOnDeviceSpeechRecognizer(this@PlatformSpeechService)
+        } else {
+            SpeechRecognizer.createSpeechRecognizer(this@PlatformSpeechService)
+        }.also { it.setRecognitionListener(this@PlatformSpeechService) }
+
     private fun listen() {
-        if (!running.get()) return
+        if (!running.get() || paused.get() || stopping.get()) return
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             val language = AndroidSpeechLanguages.candidates[languageIndex]
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -106,6 +120,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
     }
 
     override fun onPartialResults(partialResults: Bundle?) {
+        if (paused.get()) return
         val text = bestText(partialResults) ?: return
         ListeningRuntime.update { it.copy(provisionalTranscript = text) }
     }
@@ -124,7 +139,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
     }
 
     override fun onError(error: Int) {
-        if (!running.get()) return
+        if (!running.get() || paused.get() || stopping.get()) return
         val recoverable = error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT || error == SpeechRecognizer.ERROR_NO_MATCH
         val languageRejected = error == ERROR_LANGUAGE_NOT_SUPPORTED_COMPAT || error == ERROR_LANGUAGE_UNAVAILABLE_COMPAT
         when {
@@ -142,7 +157,8 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
         if (novel.isBlank()) return
         val now = System.currentTimeMillis()
         val start = lastCommitMs
-        val end = (now - startedAtMs).coerceAtLeast(start + 1)
+        val pausedMs = totalPausedMs + if (paused.get() && pausedAtMs > 0L) now - pausedAtMs else 0L
+        val end = activeRecognitionElapsedMillis(now, startedAtMs, pausedMs).coerceAtLeast(start + 1)
         lastCommitMs = end
         val segment = WhisperSegment(novel, start, end)
         lifecycleScope.launch(Dispatchers.IO) {
@@ -158,7 +174,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
         bundle?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
 
     private fun restartIfNeeded() {
-        if (!running.get() || restarting) return
+        if (!running.get() || paused.get() || stopping.get() || restarting) return
         restarting = true
         lifecycleScope.launch {
             recognizer?.cancel()
@@ -175,7 +191,39 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
         return true
     }
 
+    private fun pauseRecognizer() {
+        if (!running.get() || paused.get() || stopping.get()) return
+        paused.set(true)
+        pausedAtMs = System.currentTimeMillis()
+        restarting = false
+        recognizer?.stopListening()
+        ListeningRuntime.update { it.copy(paused = true, audioLevel = 0f, recoverableError = null) }
+        promoteToForeground("Paused")
+    }
+
+    private fun resumeRecognizer() {
+        if (!running.get() || !paused.get() || stopping.get()) return
+        if (ActivityCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            ListeningRuntime.update {
+                it.copy(paused = true, audioLevel = 0f, recoverableError = "Microphone permission is required to resume speech recognition.")
+            }
+            promoteToForeground("Paused")
+            return
+        }
+        val now = System.currentTimeMillis()
+        if (pausedAtMs > 0L) totalPausedMs += now - pausedAtMs
+        pausedAtMs = 0L
+        paused.set(false)
+        ListeningRuntime.update { it.copy(paused = false, recoverableError = null) }
+        promoteToForeground("Android on-device recognizer")
+        if (recognizer == null) recognizer = createRecognizer()
+        listen()
+    }
+
     private fun stopRecognizer() {
+        stopping.set(true)
+        paused.set(false)
+        ListeningRuntime.update { it.copy(paused = false, stopping = true) }
         if (!running.getAndSet(false)) {
             stopSelf()
             return
@@ -187,7 +235,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
             sessionId?.let { repository.finish(it) }
             (application as ListenerApplication).models.manager.markLoaded(null)
             ListeningRuntime.update {
-                it.copy(recording = false, stopping = false, activeModelId = null, backend = null, provisionalTranscript = "", audioLevel = 0f)
+                it.copy(recording = false, paused = false, stopping = false, activeModelId = null, backend = null, provisionalTranscript = "", audioLevel = 0f)
             }
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf()
@@ -197,6 +245,8 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
     private fun fail(message: String) {
         ListeningRuntime.update { ListenerRuntimeState(recoverableError = message) }
         running.set(false)
+        paused.set(false)
+        stopping.set(false)
         recognizer?.destroy()
         recognizer = null
         (application as ListenerApplication).models.manager.markLoaded(null)
@@ -206,6 +256,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
 
     override fun onDestroy() {
         running.set(false)
+        paused.set(false)
         recognizer?.destroy()
         (application as ListenerApplication).models.manager.markLoaded(null)
         super.onDestroy()
@@ -214,6 +265,7 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
     override fun onReadyForSpeech(params: Bundle?) = Unit
     override fun onBeginningOfSpeech() = Unit
     override fun onRmsChanged(rmsdB: Float) {
+        if (paused.get()) return
         val level = ((rmsdB + 2f) / 12f).coerceIn(0f, 1f)
         ListeningRuntime.update { it.copy(audioLevel = level) }
     }
@@ -254,6 +306,8 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
 
     companion object {
         const val ACTION_START = "com.listener.PLATFORM_START"
+        const val ACTION_PAUSE = "com.listener.PLATFORM_PAUSE"
+        const val ACTION_RESUME = "com.listener.PLATFORM_RESUME"
         const val ACTION_STOP = "com.listener.PLATFORM_STOP"
         const val EXTRA_CADENCE_SECONDS = "cadence_seconds"
         const val ENGINE_ID = "android"
@@ -263,6 +317,9 @@ class PlatformSpeechService : LifecycleService(), RecognitionListener {
         private const val ERROR_LANGUAGE_UNAVAILABLE_COMPAT = 13
     }
 }
+
+internal fun activeRecognitionElapsedMillis(nowMs: Long, startedAtMs: Long, totalPausedMs: Long): Long =
+    (nowMs - startedAtMs - totalPausedMs).coerceAtLeast(0L)
 
 internal object AndroidSpeechLanguages {
     val candidates = listOf(

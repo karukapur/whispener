@@ -94,7 +94,13 @@ class CoreLogicTest {
     }
     @Test fun lifecycleStopsFromRecordingAndInterruption() {
         assertEquals(RecordingState.STOPPING, reduce(RecordingState.RECORDING, RecordingEvent.Stop))
+        assertEquals(RecordingState.STOPPING, reduce(RecordingState.PAUSED, RecordingEvent.Stop))
         assertEquals(RecordingState.STOPPING, reduce(RecordingState.INTERRUPTED, RecordingEvent.Stop))
+    }
+
+    @Test fun lifecyclePausesAndResumesWithinRecording() {
+        assertEquals(RecordingState.PAUSED, reduce(RecordingState.RECORDING, RecordingEvent.Pause))
+        assertEquals(RecordingState.RECORDING, reduce(RecordingState.PAUSED, RecordingEvent.Resume))
     }
     @Test fun checksumFailureIsDetected() {
         val dir = createTempDirectory("listener-test").toFile(); val file = File(dir, "x").apply { writeText("bad") }
@@ -135,6 +141,20 @@ class CoreLogicTest {
         assertEquals("middle", adaptiveSummaryCadencePhase(119))
         assertEquals(10_000, adaptiveSummaryCadenceMillis(120))
         assertEquals("sustained", adaptiveSummaryCadencePhase(300))
+    }
+
+    @Test fun pausedRuntimeBlocksNewSummaryRequestsWithoutClearingPendingTranscript() {
+        val paused = ListenerRuntimeState(recording = true, paused = true, stableTranscript = "舊舊新新新")
+
+        assertFalse(summaryRequestAllowed(paused))
+        assertEquals("新新新", paused.finalizedTranscriptForSummary().deltaSince("舊舊"))
+        assertTrue(paused.finalizedTranscriptForSummary().deltaSince("舊舊").length >= MIN_CHINESE_DELTA_FOR_SUMMARY_CHARS)
+        assertTrue(summaryRequestAllowed(paused.copy(paused = false)))
+    }
+
+    @Test fun androidRecognitionElapsedExcludesPausedDuration() {
+        assertEquals(7_000L, activeRecognitionElapsedMillis(nowMs = 15_000L, startedAtMs = 3_000L, totalPausedMs = 5_000L))
+        assertEquals(0L, activeRecognitionElapsedMillis(nowMs = 4_000L, startedAtMs = 8_000L, totalPausedMs = 0L))
     }
 
     @Test fun unchangedSummaryCommitDoesNotAppendHistory() {
@@ -181,6 +201,26 @@ class CoreLogicTest {
         assertEquals("舊".repeat(800), inputs.chineseContinuityTail)
         assertEquals("新".repeat(2_000), inputs.newChineseDelta)
         assertEquals(fullDelta, inputs.fullDelta)
+        assertEquals(stableBefore.length + 2_000, inputs.coveredTranscript.length)
+        assertNull(inputs.estimatedGroqRequestTokens)
+    }
+
+    @Test fun groqSummaryPromptInputsUseSmallerProviderProfileAndKeepChunkCoverage() {
+        val stableBefore = "舊".repeat(1_000)
+        val fullDelta = "新".repeat(900)
+        val inputs = summaryPromptInputs(
+            transcript = stableBefore + fullDelta,
+            lastSentTranscript = stableBefore,
+            currentContext = ListeningContext("Previous heading", List(6) { "Previous detail $it with extra text" }),
+            modelId = GROQ_GPT_OSS_20B_REMOTE_MODEL_ID,
+        )
+
+        assertTrue(inputs.previousEnglishSummary.length <= summaryPromptProfile(GROQ_GPT_OSS_20B_REMOTE_MODEL_ID).previousEnglishSummaryChars)
+        assertEquals("舊".repeat(160), inputs.chineseContinuityTail)
+        assertEquals("新".repeat(800), inputs.newChineseDelta)
+        assertEquals(fullDelta, inputs.fullDelta)
+        assertEquals(stableBefore.length + 800, inputs.coveredTranscript.length)
+        assertNotNull(inputs.estimatedGroqRequestTokens)
     }
 
     @Test fun summaryDeltaGuardStartsAtThreeChineseChars() {
@@ -219,6 +259,17 @@ class CoreLogicTest {
         assertTrue(text.contains("[REDACTED]"))
         assertFalse(text.contains("sk-or-v1-secret"))
         dir.deleteRecursively()
+    }
+
+    @Test fun summaryTraceFieldsIncludePausedState() {
+        val fields = summaryTraceFields(
+            ListenerPreferences(remoteEnabled = true),
+            ListenerRuntimeState(recording = true, paused = true, stableTranscript = "你好"),
+        )
+
+        assertEquals("yes", fields["recording"])
+        assertEquals("yes", fields["paused"])
+        assertEquals("2", fields["stableTranscriptChars"])
     }
 
     @Test fun failedSummaryTraceIncludesSafeRemoteDiagnosticsAndNoTranscriptAdvance() {
@@ -294,6 +345,34 @@ class CoreLogicTest {
         assertEquals(179_560L, decision.durationMillis)
     }
 
+    @Test fun rateLimitCooldownUsesTokenResetWhenRemainingTokensCannotFitRequest() {
+        val decision = rateLimitCooldownDecision(
+            diagnostics = RemoteFailureDiagnostics(
+                retryAfterSeconds = "1",
+                rateLimitRemainingTokens = "2182",
+                rateLimitResetTokens = "43.635s",
+            ),
+            estimatedRequestTokens = 2_400,
+        )
+
+        assertEquals("retry-after-and-ratelimit-reset-tokens", decision.source)
+        assertEquals(43_635L, decision.durationMillis)
+    }
+
+    @Test fun groqTokenBudgetSkipsRequestsThatWouldExceedRollingWindow() {
+        val budget = SummaryTokenBudgetTracker(clock = { 0L }, initialLimitTokens = 8_000, reserveTokens = 500)
+        budget.recordRequest(4_000, atMillis = 0L)
+        budget.recordRequest(3_000, atMillis = 1_000L)
+
+        val cooldown = budget.cooldownFor(estimatedTokens = 800, atMillis = 2_000L)
+
+        assertNotNull(cooldown)
+        assertEquals(7_000, cooldown?.usedTokens)
+        assertEquals(500, cooldown?.remainingTokens)
+        assertEquals(58_000L, cooldown?.remainingMillis)
+        assertNull(budget.cooldownFor(estimatedTokens = 800, atMillis = 60_000L))
+    }
+
     @Test fun rateLimitBackoffSkipsUntilCooldownExpiresAndThenClears() {
         var now = 1_000L
         val backoff = SummaryRateLimitBackoff { now }
@@ -322,6 +401,7 @@ class CoreLogicTest {
         assertTrue(text.contains("If the Chinese transcript is good but English is missing"))
         assertTrue(text.contains("missing_openrouter_key"))
         assertTrue(text.contains("stable_transcript_delta_below_minimum"))
+        assertTrue(text.contains("listening_paused"))
         assertTrue(text.contains("phase=Waiting for OpenRouter key"))
         assertTrue(text.contains("Persisted summary"))
         assertTrue(text.contains("summary_attempt_skipped"))

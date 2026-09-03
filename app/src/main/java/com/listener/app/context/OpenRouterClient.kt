@@ -122,7 +122,7 @@ class OpenRouterClient(
             }
             put("temperature", 0)
             if (requestTarget == RemoteRequestTarget.GROQ) {
-                put("max_completion_tokens", 360)
+                put("max_completion_tokens", GROQ_SUMMARY_MAX_COMPLETION_TOKENS)
                 put("reasoning_effort", "low")
             } else {
                 put("max_tokens", 360)
@@ -432,6 +432,8 @@ class OpenRouterClient(
         private const val SAFE_RESPONSE_EXCERPT_CHARS = 160
     }
 }
+
+internal const val GROQ_SUMMARY_MAX_COMPLETION_TOKENS = 220
 
 class GroqClient(
     http: OkHttpClient = OkHttpClient.Builder().callTimeout(20, TimeUnit.SECONDS).build(),

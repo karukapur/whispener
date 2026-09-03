@@ -29,6 +29,8 @@ The local model selection and remote summary selection are intentionally separat
 5. Successful remote output is parsed into `ListeningContext`, committed to `StreamingContextState`, and persisted to the current session.
 6. Failed remote output must not stop recording and must not mark Chinese text as successfully summarized.
 
+Pause is session-local: `recording` remains true while `paused` is true, microphone capture stops, audio focus is released, elapsed active-listening time is frozen, and no new Groq/OpenRouter initial or fallback request may begin. Already queued local transcription or an already issued remote request may finish and update UI. Resume continues the same service, engine/recognizer, transcript, English context, session, and adaptive summary phase; any unsummarized finalized Chinese is attempted after Resume.
+
 `lastSentTranscript` should advance only after a valid remote summary response, including a valid unchanged response. Advancing it after a failed remote request causes English context gaps because later ticks think the Chinese text was already processed.
 
 ## OpenRouter Policy
@@ -51,6 +53,7 @@ OpenRouter free-model availability changes over time. Do not hard-code a specifi
 - Use strict non-streaming structured output with low reasoning effort because Groq does not combine streaming with structured output.
 - Remote summaries currently use the same adaptive cadence trial for every remote model: 5 seconds during the first recording minute, 8 seconds during the second minute, and 10 seconds afterward. This schedule is based on Groq cadence experiments; do not treat it as OpenRouter-specific evidence until OpenRouter has been remeasured.
 - Groq and OpenRouter `RateLimited` failures should start a header-driven cooldown before retrying the same remote model. Keep local transcription running and leave `lastSentTranscript` unchanged during cooldown.
+- Groq requests should also pass through a local rolling token-budget guard. If the next estimated request would exceed the Groq token-per-minute budget, skip the remote call with `groq_token_budget_cooldown`; keep local transcription running and leave unsent finalized Chinese pending.
 - If Groq reports model unavailability and an OpenRouter key exists, the existing one-time `openrouter/free` fallback may run. Other Groq failures keep local transcription active and leave `lastSentTranscript` unchanged.
 
 ## Trace Debugging
@@ -66,15 +69,18 @@ rg -n "summary_attempt|openrouter|groq|remoteEnabled|selectedRemoteModel|summary
 Important trace fields:
 
 - `engine`, `backend`, `activeModelId`: local speech path.
+- `paused`: whether the session is open but microphone capture and new summary requests are suspended.
 - `remoteEnabled`, `apiKeyPresent`, `selectedRemoteModel`: remote summary setup.
 - `stableTranscriptChars`, `provisionalTranscriptChars`: finalized versus provisional Chinese text.
 - `summary_attempt_skipped reason=...`: local decision gate prevented a remote call.
+- `pause_recording_requested` / `resume_recording_requested`: UI requested session-local pause or resume.
 - `openrouter_request_started`: the app sent a remote request.
 - `groq_request_started`: the app sent a strict non-streaming GPT-OSS 20B request directly to Groq.
 - `openrouter_first_streaming_draft`: first parseable streamed English context.
 - `summary_response_committed`: English context was accepted and persisted.
 - `summary_response_failed`: remote/API/parsing failure; local transcription may still be healthy.
 - `summary_rate_limit_cooldown_started`: a `RateLimited` response paused retries for the same remote model.
+- `groq_token_budget_cooldown`: the app skipped a Groq request locally because the estimated request would exceed the rolling token budget.
 - `responseChars`, `streamDeltaChars`, `doneSeen`, `parseStage`, `finishReason`, `sseErrorSeen`, `responseHash`, `safeResponseExcerpt`: bounded failure diagnostics only; excerpts are redacted/truncated and full model output is not logged.
 - `retryAfterSeconds`, `rateLimitRemainingRequests`, `rateLimitResetRequests`, `rateLimitRemainingTokens`, `rateLimitResetTokens`: safe provider rate-limit headers when returned.
 
@@ -88,6 +94,8 @@ For the common "Chinese works, English missing" report, classify the trace befor
 - `stable_transcript_unchanged_since_last_sent`: no new finalized Chinese since the last valid summary.
 - `stable_transcript_delta_below_minimum`: fewer than three new finalized Chinese characters are pending; they should accumulate and be sent once the guard is met.
 - `remote_rate_limit_cooldown`: previous `RateLimited` response is still cooling down; local transcript capture should continue and the unsent finalized Chinese should remain pending.
+- `groq_token_budget_cooldown`: a new Groq request would exceed the local token-per-minute budget estimate; finalized Chinese remains pending for a later bounded chunk.
+- `listening_paused`: Pause is active; no new microphone audio or Groq/OpenRouter request should begin, and unsent finalized Chinese should remain pending until Resume.
 - `ModelUnavailable` / `No endpoints found`: remote model endpoint issue; prefer router fallback.
 - `InvalidResponse`: model responded but parser rejected it; use `parseStage`, `[DONE]` state, finish reason, and the safe excerpt/hash to distinguish truncated streams from malformed model content.
 
