@@ -25,9 +25,13 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.EnterTransition
 import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.animateColor
 import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -327,6 +331,12 @@ private const val TabFadeInMillis = 150
 private const val TabFadeOutMillis = 90
 private const val TabSlideMillis = 180
 private const val TabSlideDistanceDivisor = 18
+private const val ListenTitle = "Listen"
+private const val ListeningTitle = "Listening"
+private const val ListeningTypewriterDelayMillis = 140L
+private const val RecordingBreathMillis = 1_400
+private val RecordingRedDark = Color(0xFFC62828)
+private val RecordingRedBright = Color(0xFFFF5252)
 
 @Composable fun ListeningScreen(
     recording: Boolean,
@@ -370,7 +380,7 @@ private const val TabSlideDistanceDivisor = 18
         val maxWidthPx = with(density) { maxWidth.toPx() }.coerceAtLeast(1f)
         val maxHeightPx = with(density) { maxHeight.toPx() }.coerceAtLeast(1f)
         Column(Modifier.fillMaxSize(), verticalArrangement = Arrangement.spacedBy(ListenerSpacing.Small)) {
-            ScreenTitle("Listen")
+            ListeningScreenTitle(recording)
             if (wide) {
                 Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     ContextCard(
@@ -418,110 +428,56 @@ private const val TabSlideDistanceDivisor = 18
                 toggle = onToggle,
             )
         }
-        CompactListenStatusOverlay(
-            recording = recording,
-            modelLoading = modelLoading,
-            stopping = stopping,
-            elapsed = elapsedSeconds,
-            audioLevel = audioLevel,
-            activeModelId = activeModelId,
-            backend = backend,
-            modifier = Modifier.align(Alignment.TopEnd),
-        )
     }
 }
 
-@Composable private fun CompactListenStatusOverlay(
-    recording: Boolean,
-    modelLoading: Boolean,
-    stopping: Boolean,
-    elapsed: Long,
-    audioLevel: Float,
-    activeModelId: String?,
-    backend: InferenceBackend?,
-    modifier: Modifier = Modifier,
-) {
-    val showStatus = recording || modelLoading || stopping
-    val indicatorAlpha by animateFloatAsState(
-        targetValue = if (recording) 0.55f + audioLevel * 0.45f else 0.28f,
-        animationSpec = tween(ListenerMotion.FastDurationMillis),
-        label = "recording indicator",
-    )
-    AnimatedVisibility(visible = showStatus, enter = fadeIn(), exit = fadeOut(), modifier = modifier) {
-        Surface(
-            color = MaterialTheme.colorScheme.surfaceContainerLow.copy(alpha = 0.96f),
-            contentColor = MaterialTheme.colorScheme.onSurface,
-            shape = MaterialTheme.shapes.medium,
-            border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.58f)),
-            modifier = Modifier.widthIn(max = 180.dp).testTag("listen-header-status"),
-        ) {
-            Column(
-                Modifier.padding(horizontal = ListenerSpacing.Small, vertical = 6.dp),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
-            ) {
-                CompactRecordingRow(
-                    recording = recording,
-                    modelLoading = modelLoading,
-                    stopping = stopping,
-                    elapsed = elapsed,
-                    audioLevel = audioLevel,
-                    activeModelId = activeModelId,
-                    backend = backend,
-                    indicatorAlpha = indicatorAlpha,
-                )
+@Composable private fun ListeningScreenTitle(recording: Boolean) {
+    val motionEnabled = remember {
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.O || ValueAnimator.areAnimatorsEnabled()
+    }
+    var title by remember { mutableStateOf(if (recording && !motionEnabled) ListeningTitle else ListenTitle) }
+
+    LaunchedEffect(recording, motionEnabled) {
+        if (!motionEnabled) {
+            title = if (recording) ListeningTitle else ListenTitle
+        } else if (recording) {
+            ListeningTitle.drop(title.length).forEach { character ->
+                delay(ListeningTypewriterDelayMillis)
+                title += character
+            }
+        } else {
+            while (title.length > ListenTitle.length) {
+                delay(ListeningTypewriterDelayMillis)
+                title = title.dropLast(1)
             }
         }
     }
+
+    Text(
+        title,
+        style = MaterialTheme.typography.headlineMedium,
+        color = if (recording) breathingRecordingColor(motionEnabled) else MaterialTheme.colorScheme.onBackground,
+        modifier = Modifier
+            .padding(start = ListenerSpacing.Small, bottom = ListenerSpacing.Small)
+            .semantics {
+                contentDescription = if (recording) "Listening, recording active" else ListenTitle
+            }
+            .testTag("listen-title"),
+    )
 }
 
-@Composable private fun CompactRecordingRow(
-    recording: Boolean,
-    modelLoading: Boolean,
-    stopping: Boolean,
-    elapsed: Long,
-    audioLevel: Float,
-    activeModelId: String?,
-    backend: InferenceBackend?,
-    indicatorAlpha: Float,
-) {
-    if (!recording && !modelLoading && !stopping) return
-    Row(
-        Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(ListenerSpacing.ExtraSmall),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Box(
-            Modifier
-                .size(8.dp)
-                .graphicsLayer { alpha = indicatorAlpha }
-                .background(if (recording) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary, CircleShape)
-                .semantics { contentDescription = if (recording) "Recording active" else "Recording stopped" },
-        )
-        Text(
-            compactRecordingLabel(recording, modelLoading, stopping, elapsed, activeModelId, backend),
-            style = MaterialTheme.typography.labelSmall,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            modifier = Modifier.weight(1f),
-        )
-        if (recording && !modelLoading) AudioLevelMeter(audioLevel)
-    }
-}
-
-private fun compactRecordingLabel(
-    recording: Boolean,
-    modelLoading: Boolean,
-    stopping: Boolean,
-    elapsed: Long,
-    activeModelId: String?,
-    backend: InferenceBackend?,
-): String = when {
-    stopping -> "Finishing"
-    modelLoading -> "Loading ${localModelDisplayName(activeModelId)}"
-    recording -> "Recording %02d:%02d".format(elapsed / 60, elapsed % 60)
-    activeModelId != null -> localModelDisplayName(activeModelId)
-    backend != null -> backend.label
-    else -> ""
+@Composable private fun breathingRecordingColor(motionEnabled: Boolean): Color {
+    if (!motionEnabled) return RecordingRedBright
+    val transition = rememberInfiniteTransition(label = "recording title breathing")
+    return transition.animateColor(
+        initialValue = RecordingRedDark,
+        targetValue = RecordingRedBright,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = RecordingBreathMillis, easing = ListenerMotion.EmphasisEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "recording title color",
+    ).value
 }
 
 @Composable private fun Splitter(modifier: Modifier, vertical: Boolean, onDrag: (Float) -> Unit) {
@@ -596,7 +552,7 @@ private fun legacyContextState(global: String, details: List<String>): Streaming
     }
     val idleSphereVisible = displayedContext == null && showIdleSphere
     val sphereSize = 462.dp
-    val sphereCutOffset = 64.dp
+    val sphereCutOffset = 84.dp
     Card(
         modifier = modifier.testTag("context-card"),
         shape = MaterialTheme.shapes.extraLarge,
@@ -1189,14 +1145,6 @@ private const val FIRST_TOKEN_WARNING_MS = 10_000L
     }
 }
 
-private fun localModelDisplayName(id: String?): String = when (id) {
-    null, "" -> "model"
-    ModelManager.STREAMING_PARAFORMER_BILINGUAL_ID -> "Sherpa Paraformer"
-    ModelManager.SENSE_VOICE_ID -> "Sherpa SenseVoice"
-    "android" -> "Android on-device"
-    else -> id.replace('-', ' ').replace('_', ' ').replaceFirstChar(Char::uppercase)
-}
-
 @Composable private fun LanguageChip(label: String) {
     Surface(
         color = MaterialTheme.colorScheme.secondaryContainer,
@@ -1214,19 +1162,6 @@ private fun localModelDisplayName(id: String?): String = when (id) {
 private fun Int.formatCadenceMillis(): String {
     val snapped = snapSummaryCadenceMillis()
     return if (snapped % 1_000 == 0) "${snapped / 1_000}s" else "%.1fs".format(snapped / 1_000f)
-}
-
-@Composable private fun AudioLevelMeter(level: Float) {
-    Row(
-        Modifier.height(24.dp).semantics { contentDescription = "Microphone level ${(level * 100).toInt()} percent" },
-        horizontalArrangement = Arrangement.spacedBy(3.dp),
-        verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
-    ) {
-        listOf(0.55f, 1f, 0.72f).forEachIndexed { index, multiplier ->
-            val height by animateDpAsState((6 + 16 * (level * multiplier)).dp, label = "audio level $index")
-            Box(Modifier.width(3.dp).height(height).background(MaterialTheme.colorScheme.primary, MaterialTheme.shapes.extraSmall))
-        }
-    }
 }
 
 @Composable private fun SessionsScreen(

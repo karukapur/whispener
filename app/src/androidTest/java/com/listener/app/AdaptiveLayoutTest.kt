@@ -129,7 +129,7 @@ class AdaptiveLayoutTest {
             )
         }
 
-        compose.onNodeWithTag("listen-header-status").assertExists()
+        compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
         compose.onNodeWithTag("context-current-detail").assertExists()
         compose.onNodeWithContentDescription("Loading English context").assertExists()
         compose.onNodeWithTag("model-loading-indicator", useUnmergedTree = true).assertExists()
@@ -179,9 +179,27 @@ class AdaptiveLayoutTest {
         val transcript = compose.onNodeWithTag("transcript").getUnclippedBoundsInRoot()
         assertTrue(context.bottom <= transcript.top)
     }
-    @Test fun activeRecordingIsAnnounced() {
+    @Test fun recordingTitleReplacesHeaderStatusAndIsAnnounced() {
         setTestContent { ListeningScreen(true, 65, 10_000, {}, {}) }
-        compose.onNodeWithContentDescription("Recording active").assertExists()
+        compose.onNodeWithTag("listen-header-status").assertDoesNotExist()
+        compose.onNodeWithContentDescription("Listening, recording active").assertExists()
+        compose.waitUntil(timeoutMillis = 1_000) {
+            compose.onAllNodesWithText("Listening").fetchSemanticsNodes().isNotEmpty()
+        }
+    }
+    @Test fun listeningTitleTypesBackToListenWhenRecordingStops() {
+        val recording = mutableStateOf(true)
+        setTestContent { ListeningScreen(recording.value, 65, 10_000, {}, {}) }
+        compose.waitUntil(timeoutMillis = 1_000) {
+            compose.onAllNodesWithText("Listening").fetchSemanticsNodes().isNotEmpty()
+        }
+
+        compose.runOnIdle { recording.value = false }
+
+        compose.onNodeWithContentDescription("Listen").assertExists()
+        compose.waitUntil(timeoutMillis = 1_000) {
+            compose.onAllNodesWithText("Listen").fetchSemanticsNodes().isNotEmpty()
+        }
     }
     @Test fun recordingRequiresInstalledModel() {
         setTestContent { ListeningScreen(false, 0, 10_000, {}, {}, animateIdleSphere = false, recordingAvailable = false) }
@@ -211,7 +229,7 @@ class AdaptiveLayoutTest {
         compose.onNodeWithText("Cancel").assertDoesNotExist()
     }
 
-    @Test fun provisionalTextAndBackendHaveAccessibleState() {
+    @Test fun provisionalTextHasAccessibleStateWithoutBackendHeader() {
         setTestContent {
             ListeningScreen(
                 recording = true,
@@ -225,7 +243,7 @@ class AdaptiveLayoutTest {
             )
         }
         compose.onNodeWithContentDescription("Provisional transcript: 暫定").assertExists()
-        compose.onNodeWithContentDescription("Inference backend Vulkan").assertExists()
+        compose.onNodeWithContentDescription("Inference backend Vulkan").assertDoesNotExist()
     }
 
     @Test fun contextHeadingStaysPinnedWhileHistoryExists() {
